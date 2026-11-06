@@ -1,6 +1,5 @@
 // Variabili globali
 let photosData = [];
-let navGraph = null;      // Grafo navigazione spaziale (nav_graph.json)
 let lkhOrder = [];        // Ordine LKH ottimale (da lkh_tour.json), se disponibile
 let currentView = 'map';  // Default: mappa
 let currentMapType = 'osm';
@@ -14,10 +13,16 @@ let tourPlaying = false;
 let tourPlayTimer = null;
 let currentLightboxIndex = -1;
 let previousView = 'map'; // View to return to when closing photo view
-let activeZoneFilter = null; // null = tutte le zone
+let activeZoneFilter = null; // Filtro globale mappa+galleria; null = tutte le zone
+let activeSearchQuery = ''; // stringa search input
+let searchDebounceTimer = null;
+let releaseSearchFocus = null; // per eventuale restore focus (se usiamo modali)
 const WELCOME_STORAGE_KEY = 'vitali-gallery-welcome-seen';
+const MAP_HERO_STORAGE_KEY = 'vitali-gallery-hero-dismissed';
+const INITIAL_URL_HASH = window.location.hash;
+const INITIAL_FOTO_PARAM = new URLSearchParams(window.location.search).get('foto');
 const TOUR_PLAY_MS = 3500;
-const PHOTO_TRANSITION_MS = 380;
+const PHOTO_TRANSITION_MS = 520;
 const PANORAMAX_API = 'https://api.panoramax.xyz/api';
 const PANORAMAX_SEARCH = `${PANORAMAX_API}/search`;
 const PANORAMAX_VIEWER = 'https://api.panoramax.xyz/en/index';
@@ -27,20 +32,236 @@ const panoramaxCache = new Map();
 let currentPanoramaxMatch = null;
 let panoramaxPannellumViewer = null;
 let lightboxImageTransitionTimer = null;
+let lightboxDisplayedPhoto = null;
+/** Archi del grafo transizioni (schema 2), chiave "from|to" → {tier, score, link, ...}. */
+const transitionEdges = new Map();
+/** id → archi uscenti ordinati (filmstrip "viste correlate"). */
+const correlatedById = new Map();
+/** @type {import('../vendor/morph-viewer/morph-viewer.js').Viewer|null} */
+let morphViewer = null;
+let morphViewerLoading = null;
+let zoneNames = {};
+let releaseWelcomeFocus = null;
+let releaseHelpFocus = null;
+let releasePanoramaxFocus = null;
 const ZONE_COLORS = [
 '#e94560', '#4ecdc4', '#ffe66d', '#a855f7', '#fb923c',
 '#22d3ee', '#86efac', '#f472b6', '#facc15', '#60a5fa',
 '#34d399', '#c084fc'
 ];
 // Bootstrap Italia sprite path
-const BI_SPRITE = 'https://cdn.jsdelivr.net/npm/bootstrap-italia@2.17.4/dist/svg/sprites.svg';
+const BI_SPRITE = 'sprites.svg';
 // ID stabile (hash) — usato solo per permalink, mai mostrato in UI
 function photoId(photo) {
 return photo.id || photo.display.split('/').pop().split('.')[0];
 }
-// Etichetta visibile per l'utente (senza nomi file)
-function photoLabel(seqIndex) {
-return `Foto ${seqIndex}`;
+function escapeHtml(str) {
+return String(str)
+.replace(/&/g, '&amp;')
+.replace(/</g, '&lt;')
+.replace(/>/g, '&gt;')
+.replace(/"/g, '&quot;');
+}
+function zoneLabel(zoneId) {
+if (!zoneId) return '';
+const key = String(zoneId);
+return zoneNames[key] || zoneNames[zoneId] || `Zona ${zoneId}`;
+}
+// Etichetta visibile — opaca: Foto N + luogo/zona/didascalia, mai filename
+function photoLabel(photo, seqIndex = 0) {
+const n = seqIndex > 0 ? seqIndex : null;
+const base = n ? `Foto ${n}` : 'Foto';
+if (!photo) return base;
+if (photo.caption) return photo.caption;
+const place = photo.place_name || (photo.cluster_id ? zoneLabel(photo.cluster_id) : null);
+return place ? `${base}, ${place}` : base;
+}
+function photoMetaDescription(photo, seqIndex) {
+const label = photoLabel(photo, seqIndex);
+if (photo.caption || photo.place_name || photo.cluster_id) {
+return `${label} — ${siteMeta?.siteTitle || document.title}`;
+}
+return `${label} geolocalizzata (${photo.lat.toFixed(4)}, ${photo.lon.toFixed(4)}) — ${siteMeta?.siteTitle || document.title}`;
+}
+function prefersReducedMotion() {
+return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+function morphKey(fromId, toId) {
+return `${fromId}|${toId}`;
+}
+function prefetchTourNeighbors(photo) {
+const order = tourNavOrder();
+const i = order.indexOf(photo);
+if (i < 0) return;
+for (const delta of [-1, 1]) {
+const p = order[(i + delta + order.length) % order.length];
+if (!p?.display) continue;
+const im = new Image();
+im.decoding = 'async';
+im.src = p.display;
+}
+}
+const TIER_RANK = { morph: 1, anchor: 0 };
+/** Grafo transizioni visive (ALIKED+LightGlue → tools/site/build_transition_graph.py). */
+async function loadTransitionGraph() {
+try {
+// no-cache = rivalida sempre (304 se invariato): i dati cambiano a ogni rigenerazione
+const res = await fetch('dati/transition_graph.json', { cache: 'no-cache' });
+if (!res.ok) return;
+const data = await res.json();
+if (Number(data.schema_version) !== 2) return;
+transitionEdges.clear();
+correlatedById.clear();
+for (const edge of data.edges || []) {
+if (!edge?.from || !edge?.to || !TIER_RANK.hasOwnProperty(edge.tier)) continue;
+transitionEdges.set(morphKey(edge.from, edge.to), edge);
+}
+for (const edge of transitionEdges.values()) {
+if (!correlatedById.has(edge.from)) correlatedById.set(edge.from, []);
+correlatedById.get(edge.from).push(edge);
+}
+for (const edges of correlatedById.values()) {
+edges.sort((a, b) =>
+TIER_RANK[b.tier] - TIER_RANK[a.tier] ||
+Number(b.score || 0) - Number(a.score || 0)
+);
+}
+const current = photosData[currentLightboxIndex];
+if (current) renderCorrelatedFilmstrip(current);
+} catch (_) {
+/* grafo opzionale: senza, tutte le transizioni sono crossfade */
+}
+}
+function transitionEdgeFor(fromId, toId) {
+return transitionEdges.get(morphKey(fromId, toId)) || null;
+}
+function setMorphViewerVisible(on) {
+const container = document.querySelector('.lightbox-image-container');
+const img = document.getElementById('lightbox-image');
+const next = document.getElementById('lightbox-image-next');
+const canvas = container?.querySelector('.morph-viewer-canvas');
+if (canvas) canvas.classList.toggle('is-active', !!on);
+if (img) {
+img.classList.toggle('morph-hidden', !!on);
+if (on) {
+img.style.opacity = '0';
+img.style.visibility = 'hidden';
+} else {
+img.style.visibility = '';
+}
+}
+if (next && on) next.remove();
+if (container) container.classList.toggle('morph-mode', !!on);
+if (on && morphViewer) morphViewer.resize();
+}
+/** Mostra la foto nel viewer Three (morph/anchor da grafo, altrimenti crossfade). */
+async function showWithMorphViewer(photo, { from = null, animate = false } = {}) {
+const imgElement = document.getElementById('lightbox-image');
+const loader = document.getElementById('lightbox-loader');
+if (!imgElement) return false;
+const viewer = await ensureMorphViewer();
+if (!viewer || currentLightboxIndex !== photosData.indexOf(photo)) return false;
+const toId = photoId(photo);
+if (typeof window.resetZoom === 'function') window.resetZoom();
+removeLightboxImageNext();
+setMorphViewerVisible(true);
+loader.style.display = 'none';
+if (animate && from && photoId(from) !== toId) {
+const fromId = photoId(from);
+if (viewer.currentId !== fromId) await viewer.goToId(fromId, false);
+if (currentLightboxIndex !== photosData.indexOf(photo)) return false;
+await viewer.goToId(toId, true);
+} else {
+await viewer.goToId(toId, false);
+}
+if (currentLightboxIndex !== photosData.indexOf(photo)) return false;
+lightboxDisplayedPhoto = photo;
+prefetchTourNeighbors(photo);
+const order = tourNavOrder();
+const i = order.indexOf(photo);
+const near = [];
+if (i >= 0) {
+if (order[i - 1]) near.push(photoId(order[i - 1]));
+if (order[i + 1]) near.push(photoId(order[i + 1]));
+}
+viewer.prefetchIds(near);
+return true;
+}
+async function ensureMorphViewer() {
+if (morphViewer) return morphViewer;
+if (morphViewerLoading) return morphViewerLoading;
+morphViewerLoading = (async () => {
+const mod = await import('./vendor/morph-viewer/morph-viewer.js?v=grid2d');
+const container = document.querySelector('.lightbox-image-container');
+if (!container) return null;
+morphViewer = new mod.Viewer(container, {
+transitionLookup: transitionEdgeFor,
+reducedMotion: prefersReducedMotion(),
+crossfadeMs: PHOTO_TRANSITION_MS
+});
+const photos = photosData.map((p) => ({
+id: photoId(p),
+url: p.display,
+width: p.width || 1000,
+height: p.height || 1000
+}));
+const startPhoto = photosData[currentLightboxIndex];
+await morphViewer.load(photos, startPhoto ? { startId: photoId(startPhoto) } : {});
+return morphViewer;
+})();
+try {
+return await morphViewerLoading;
+} finally {
+morphViewerLoading = null;
+}
+}
+function disposeMorphViewer() {
+if (morphViewer) {
+morphViewer.dispose();
+morphViewer = null;
+}
+setMorphViewerVisible(false);
+}
+function applyImageAspectRatio(img, photo) {
+if (!img || !photo) return;
+img.removeAttribute('width');
+img.removeAttribute('height');
+// Sempre rispettare l'AR: niente fill/stretch del box lightbox
+if (photo.width && photo.height) {
+img.style.aspectRatio = `${photo.width} / ${photo.height}`;
+} else {
+img.style.aspectRatio = '';
+}
+img.style.width = '';
+img.style.height = '';
+img.style.maxWidth = '100%';
+img.style.maxHeight = '100%';
+img.style.objectFit = 'contain';
+}
+function trapFocus(container) {
+const focusable = container.querySelectorAll(
+'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+);
+if (!focusable.length) return () => {};
+const first = focusable[0];
+const last = focusable[focusable.length - 1];
+const restore = document.activeElement;
+first.focus();
+function onKeyDown(e) {
+if (e.key !== 'Tab') return;
+if (e.shiftKey && document.activeElement === first) {
+e.preventDefault();
+last.focus();
+} else if (!e.shiftKey && document.activeElement === last) {
+e.preventDefault();
+first.focus();
+}
+}
+container.addEventListener('keydown', onKeyDown);
+return () => {
+container.removeEventListener('keydown', onKeyDown);
+restore?.focus?.call(restore);
+};
 }
 let siteMeta = null;
 function readSiteMeta() {
@@ -92,9 +313,9 @@ return `${base}/${path.replace(/^\//, '')}`;
 function updatePageMeta(photo, seqIndex = 1) {
 if (!siteMeta) siteMeta = readSiteMeta();
 if (photo) {
-const label = photoLabel(seqIndex);
+const label = photoLabel(photo, seqIndex);
 const title = `${label} — ${siteMeta.siteTitle}`;
-const desc = `${label} geolocalizzata (${photo.lat.toFixed(4)}, ${photo.lon.toFixed(4)}) — ${siteMeta.siteTitle}`;
+const desc = photoMetaDescription(photo, seqIndex);
 const pageUrl = siteMeta.siteUrl
 ? `${siteMeta.siteUrl}/?foto=${photoId(photo)}`
 : `${window.location.origin}${window.location.pathname}?foto=${photoId(photo)}`;
@@ -131,10 +352,70 @@ return `<svg class="${cls}"><use href="${BI_SPRITE}#${name}"></use></svg>`;
 function photosWithGps() {
 return photosData.filter(p => p.has_gps && p.lat && p.lon);
 }
-function visiblePhotos() {
+function normalizeSearchQuery(q) {
+return String(q || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+function getSearchState() {
+const q = normalizeSearchQuery(activeSearchQuery);
+if (!q) return { type: 'empty' };
+// Numeric search: "12" or "foto 12" -> index in the current tour order (when available)
+const mFoto = q.match(/^(?:foto\s*)?(\d+)\s*$/i);
+if (mFoto) return { type: 'numeric', index: parseInt(mFoto[1], 10) };
+// Zone restriction-only: "zona 2" or "z2"
+let zoneRestriction = null;
+const mZone = q.match(/^(?:zona|z)\s*(\d+)\s*$/i);
+if (mZone) zoneRestriction = parseInt(mZone[1], 10);
+// Inline zone restriction: "... zona 2 ..." or "... z2 ..."
+const inlineZone = q.match(/\b(?:zona|z)\s*(\d+)\b/i);
+if (inlineZone) zoneRestriction = parseInt(inlineZone[1], 10);
+const qWithoutZone = zoneRestriction != null
+? q.replace(/\b(?:zona|z)\s*\d+\b/g, '').trim()
+: q;
+const tokens = qWithoutZone.split(' ').filter(Boolean);
+return { type: 'text', tokens, zoneRestriction };
+}
+function basePhotosByActiveZoneNoSearch() {
 const gps = photosWithGps();
 if (activeZoneFilter === null) return gps;
 return gps.filter(p => p.cluster_id === activeZoneFilter);
+}
+function baseNavOrderByActiveZoneNoSearch() {
+// When LKH is available, tour order is based on it; otherwise it falls back to gallery order.
+if (lkhOrder.length) {
+if (activeZoneFilter === null) return lkhOrder;
+return lkhOrder.filter(p => p.cluster_id === activeZoneFilter);
+}
+return basePhotosByActiveZoneNoSearch();
+}
+function textSearchHaystack(photo) {
+const parts = [];
+if (photo.caption) parts.push(photo.caption);
+if (photo.place_name) parts.push(photo.place_name);
+if (photo.cluster_id) parts.push(zoneLabel(photo.cluster_id));
+return parts.join(' ').toLowerCase();
+}
+function photoMatchesTextSearch(photo, state) {
+if (state.zoneRestriction != null && photo.cluster_id !== state.zoneRestriction) return false;
+const tokens = state.tokens || [];
+if (!tokens.length) return true;
+const hay = textSearchHaystack(photo);
+return tokens.every(t => hay.includes(t));
+}
+function visiblePhotos() {
+const st = getSearchState();
+const baseNav = baseNavOrderByActiveZoneNoSearch();
+if (st.type === 'empty') return basePhotosByActiveZoneNoSearch();
+if (st.type === 'numeric') {
+const idx = st.index - 1;
+if (idx < 0 || idx >= baseNav.length) return [];
+return [baseNav[idx]];
+}
+// Text search (place/caption/zone)
+let base = basePhotosByActiveZoneNoSearch();
+if (st.zoneRestriction != null || (st.tokens && st.tokens.length)) {
+base = base.filter(p => photoMatchesTextSearch(p, st));
+}
+return base;
 }
 function clusterColor(id) {
 if (!id) return '#0066cc';
@@ -147,21 +428,57 @@ const b = parseInt(hex.slice(5, 7), 16);
 const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
 return lum > 0.62 ? '#17324d' : '#fff';
 }
-function zoneChipStyles(zoneId, isActive) {
+function zoneChipStyleAttr(zoneId, isActive) {
 const col = clusterColor(zoneId);
-const r = parseInt(col.slice(1, 3), 16);
-const g = parseInt(col.slice(3, 5), 16);
-const b = parseInt(col.slice(5, 7), 16);
 if (isActive) {
 const text = zoneChipTextColor(col);
-return `background:${col};border-color:${col};color:${text}`;
+return `--zone-color:${col};--zone-text:${text}`;
 }
-return `background:rgba(${r},${g},${b},0.16);border-color:${col};color:#17324d`;
+return `--zone-color:${col}`;
+}
+function scrollGalleryToTop() {
+document.getElementById('gallery-view')?.scrollTo({ top: 0, behavior: 'smooth' });
+}
+function applyZoneFilter(next) {
+if (next === activeZoneFilter) return;
+activeZoneFilter = next;
+const count = visiblePhotos().length;
+const label = next === null ? 'Tutte le zone' : zoneLabel(next);
+announce(next === null ? `Tutte le zone, ${count} foto` : `${label}, ${count} foto`);
+renderZoneBar();
+renderGallery();
+updateMapMarkers();
+updateTourPolyline();
+updateTourProgress();
+if (next !== null) {
+const st = getSearchState();
+const ordered = st.type === 'empty'
+? baseNavOrderByActiveZoneNoSearch()
+: visiblePhotos();
+const firstPhoto = ordered[0];
+if (firstPhoto) {
+const index = photosData.indexOf(firstPhoto);
+if (index >= 0) openLightbox(index);
+}
+} else {
+scrollGalleryToTop();
+if (currentView === 'map' && map) {
+setTimeout(() => fitMapToVisiblePhotos(), 50);
+}
+}
+document.activeElement?.blur?.();
 }
 function tourPhotosForPolyline() {
 if (!lkhOrder.length) return [];
-if (activeZoneFilter === null) return lkhOrder;
-return lkhOrder.filter(p => p.cluster_id === activeZoneFilter);
+const st = getSearchState();
+const baseNav = baseNavOrderByActiveZoneNoSearch();
+if (st.type === 'empty') return baseNav;
+if (st.type === 'numeric') {
+const idx = st.index - 1;
+if (idx < 0 || idx >= baseNav.length) return [];
+return [baseNav[idx]];
+}
+return baseNav.filter(p => photoMatchesTextSearch(p, st));
 }
 function updateTourPolyline() {
 if (!map) return;
@@ -224,11 +541,12 @@ openLightbox(photosData.indexOf(navOrder[0]));
 switchView('photo');
 }
 announce('Percorso automatico avviato');
+const intervalMs = prefersReducedMotion() ? TOUR_PLAY_MS * 2 : TOUR_PLAY_MS;
 tourPlayTimer = setInterval(() => {
 if (currentView !== 'photo') switchView('photo');
-if (!spatialNavigate('forward', true)) navigateLightbox(1, true);
+navigateLightbox(1, true);
 updateTourProgress();
-}, TOUR_PLAY_MS);
+}, intervalMs);
 }
 function stopTourPlay(updateButtons = true) {
 const wasPlaying = tourPlaying;
@@ -258,43 +576,6 @@ showToast._timer = setTimeout(() => {
 toast.classList.remove('show');
 toast.textContent = '';
 }, 2500);
-}
-function spatialNavEntry(index) {
-if (!navGraph?.by_index || index < 0) return null;
-return navGraph.by_index[index] || null;
-}
-function spatialNavigate(direction, fromAutoplay = false) {
-if (currentLightboxIndex < 0) return false;
-if (tourPlaying && !fromAutoplay) stopTourPlay();
-const entry = spatialNavEntry(currentLightboxIndex);
-const targetIndex = entry?.[direction];
-if (targetIndex === null || targetIndex === undefined) return false;
-const navDir = direction === 'forward' ? 1 : direction === 'back' ? -1 : 0;
-openLightbox(targetIndex, navDir);
-const labels = { forward: 'Avanti', back: 'Indietro', left: 'Sinistra', right: 'Destra' };
-announce(`${labels[direction] || direction}`);
-return true;
-}
-function updateSpatialNavUI() {
-const entry = spatialNavEntry(currentLightboxIndex);
-const labels = {
-forward: 'Avanti',
-back: 'Indietro',
-left: 'Sinistra',
-right: 'Destra'
-};
-const dirs = ['forward', 'back', 'left', 'right'];
-dirs.forEach(dir => {
-const btn = document.getElementById(`spatial-${dir}`);
-if (!btn) return;
-const targetIdx = entry?.[dir];
-const available = targetIdx !== null && targetIdx !== undefined;
-btn.disabled = !available;
-if (!available) return;
-const neighbor = entry.neighbors?.find(c => c.index === targetIdx);
-const dist = neighbor ? ` — ${neighbor.dist_m} m` : '';
-btn.title = `${labels[dir]}${dist}`;
-});
 }
 function haversineMeters(lat1, lon1, lat2, lon2) {
 const R = 6371000;
@@ -401,6 +682,8 @@ panoramaxPannellumViewer = null;
 }
 function closePanoramaxZoom() {
 destroyPanoramaxPannellum();
+releasePanoramaxFocus?.();
+releasePanoramaxFocus = null;
 document.getElementById('panoramax-zoom')?.classList.add('d-none');
 }
 function openPanoramaxZoom() {
@@ -409,6 +692,8 @@ const zoom = document.getElementById('panoramax-zoom');
 if (!zoom) return;
 destroyPanoramaxPannellum();
 zoom.classList.remove('d-none');
+releasePanoramaxFocus?.();
+releasePanoramaxFocus = trapFocus(zoom);
 const photo = photosData[currentLightboxIndex];
 const match = currentPanoramaxMatch;
 const yaw = panoramaxViewYaw(photo, match);
@@ -514,28 +799,24 @@ lon: lon2 * 180 / Math.PI
 // Carica dati
 async function loadPhotos() {
 try {
-const response = await fetch('data/photos.json');
+const response = await fetch('dati/photos.json', { cache: 'no-cache' });
 const data = await response.json();
 photosData = data.photos;
+zoneNames = data.zone_names || {};
 siteMeta = readSiteMeta();
 updateStats(data);
+updateMapHero(data);
 renderZoneBar();
 renderGallery();
-initMaps();
 // Restore state from URL (permalink: ?foto=id o #id)
-const hash = window.location.hash;
-const fotoParam = new URLSearchParams(window.location.search).get('foto');
-if (fotoParam) {
-const idx = photosData.findIndex(p => photoId(p) === fotoParam);
-if (idx >= 0) openLightbox(idx);
-} else if (PHOTO_HASH_RE.test(hash)) {
-openLightboxFromHash(hash);
-} else if (MAP_HASH_RE.test(hash)) {
-applyMapHash(hash);  // override the fitBounds from initMaps
-}
+const hash = INITIAL_URL_HASH;
+const fotoParam = INITIAL_FOTO_PARAM;
+initMaps();
+// Evita la race permalink: il viewer viene aperto solo dopo il grafo.
+await loadTransitionGraph();
 // Try to load LKH precomputed tour (non-blocking)
 try {
-const lkhRes = await fetch('data/lkh_tour.json');
+const lkhRes = await fetch('dati/lkh_tour.json', { cache: 'no-cache' });
 if (lkhRes.ok) {
 const lkhData = await lkhRes.json();
 const byIdx = new Map(photosData.map((p, i) => [i, p]));
@@ -547,17 +828,27 @@ lkhTourMeta = lkhData;
 updateTourPolyline();
 updateTourControlsVisibility();
 updateTourProgress();
+updateMapHero(data);
+// If the user already typed a search, we need to re-render because Foto N depends on tour order.
+if (normalizeSearchQuery(activeSearchQuery)) {
+renderZoneBar();
+renderGallery();
+updateMapMarkers();
+updateTourPolyline();
+updateTourProgress();
+}
 console.info(`LKH nav active: ${lkhOrder.length} photos, ${(lkhData.length_m / 1000).toFixed(2)} km`);
 }
 }
 } catch (_) {  }
-try {
-const navRes = await fetch('data/nav_graph.json');
-if (navRes.ok) {
-navGraph = await navRes.json();
-console.info(`Spatial nav: ${navGraph.by_index?.length || 0} entries`);
+if (fotoParam) {
+const idx = photosData.findIndex(p => photoId(p) === fotoParam);
+if (idx >= 0) openLightbox(idx);
+} else if (PHOTO_HASH_RE.test(hash)) {
+openLightboxFromHash(hash);
+} else if (MAP_HASH_RE.test(hash)) {
+applyMapHash(hash);  // override the fitBounds from initMaps
 }
-} catch (_) {  }
 maybeShowWelcome(hash);
 } catch (error) {
 console.error('Errore caricamento foto:', error);
@@ -566,58 +857,122 @@ console.error('Errore caricamento foto:', error);
 // Aggiorna statistiche
 function updateStats(data) {
 const gpsPhotos = data.photos.filter(p => p.has_gps).length;
-document.getElementById('total-photos').textContent = gpsPhotos;
+const zones = new Set(data.photos.filter(p => p.has_gps && p.cluster_id).map(p => p.cluster_id));
+const badge = document.getElementById('header-stats-badge');
+if (badge) {
+badge.textContent = zones.size > 0
+? `${gpsPhotos} foto · ${zones.size} zone`
+: `${gpsPhotos} foto`;
+}
 const welcomeCount = document.getElementById('welcome-photo-count');
 if (welcomeCount) welcomeCount.textContent = gpsPhotos;
+}
+function updateMapHero(data) {
+const hero = document.getElementById('map-hero');
+if (!hero) return;
+if (localStorage.getItem(MAP_HERO_STORAGE_KEY)) {
+hero.classList.add('map-hero--hidden');
+return;
+}
+hero.classList.remove('map-hero--hidden');
+const gpsPhotos = data?.photos?.filter(p => p.has_gps).length ?? photosWithGps().length;
+const zones = new Set((data?.photos || photosData).filter(p => p.has_gps && p.cluster_id).map(p => p.cluster_id));
+const photoCountEl = document.getElementById('hero-photo-count');
+const zoneCountEl = document.getElementById('hero-zone-count');
+const kmEl = document.getElementById('hero-tour-km');
+if (photoCountEl) photoCountEl.textContent = gpsPhotos;
+if (zoneCountEl) zoneCountEl.textContent = zones.size;
+if (kmEl) {
+kmEl.textContent = lkhTourMeta?.length_m
+? `~${(lkhTourMeta.length_m / 1000).toFixed(1)} km`
+: '—';
+}
+}
+function dismissMapHero() {
+localStorage.setItem(MAP_HERO_STORAGE_KEY, '1');
+document.getElementById('map-hero')?.classList.add('map-hero--hidden');
 }
 function renderZoneBar() {
 const bar = document.getElementById('zone-bar');
 if (!bar) return;
-const gps = photosWithGps();
+const searchActive = Boolean(normalizeSearchQuery(activeSearchQuery));
+const st = getSearchState();
+let candidates = photosWithGps();
+if (st.type === 'numeric') {
+candidates = visiblePhotos();
+} else if (st.type === 'text') {
+candidates = candidates.filter(p => photoMatchesTextSearch(p, st));
+}
 const zoneCounts = new Map();
-gps.forEach(p => {
+candidates.forEach(p => {
 const z = p.cluster_id;
 if (z) zoneCounts.set(z, (zoneCounts.get(z) || 0) + 1);
 });
 const zones = [...zoneCounts.keys()].sort((a, b) => a - b);
-if (zones.length <= 1) {
+if (candidates.length === 0) {
 bar.classList.add('d-none');
 return;
 }
 bar.classList.remove('d-none');
+const allCount = candidates.length;
+const allPressed = activeZoneFilter === null ? 'true' : 'false';
 const chips = [
-`<button type="button" class="zone-chip zone-chip--all${activeZoneFilter === null ? ' active' : ''}" data-zone="">Tutte (${gps.length})</button>`
+`<button type="button" class="zone-chip zone-chip--all" aria-pressed="${allPressed}">Tutte (${allCount})</button>`
 ];
 zones.forEach(z => {
-const active = activeZoneFilter === z ? ' active' : '';
-const style = zoneChipStyles(z, activeZoneFilter === z);
-chips.push(`<button type="button" class="zone-chip${active}" data-zone="${z}" style="${style}">Zona ${z} (${zoneCounts.get(z)})</button>`);
+const isActive = activeZoneFilter === z;
+const pressed = isActive ? 'true' : 'false';
+const style = zoneChipStyleAttr(z, isActive);
+const name = zoneLabel(z);
+chips.push(`<button type="button" class="zone-chip" data-zone="${z}" aria-pressed="${pressed}" style="${style}">${escapeHtml(name)} (${zoneCounts.get(z)})</button>`);
 });
 bar.innerHTML = chips.join('');
 bar.querySelectorAll('.zone-chip').forEach(btn => {
+// Evita focus ring al click mouse (il re-render spostava focus sul chip successivo)
+btn.addEventListener('mousedown', (e) => {
+if (e.button === 0) e.preventDefault();
+});
 btn.addEventListener('click', () => {
 const raw = btn.dataset.zone;
-activeZoneFilter = raw === '' ? null : Number(raw);
-const count = visiblePhotos().length;
-announce(raw === '' ? `Tutte le zone, ${count} foto` : `Zona ${raw}, ${count} foto`);
-renderZoneBar();
-renderGallery();
-updateMapMarkers();
-updateTourPolyline();
-updateTourProgress();
+const next = raw === undefined || raw === '' ? null : Number(raw);
+applyZoneFilter(next);
 });
+});
+requestAnimationFrame(() => {
+const active = document.activeElement;
+if (active instanceof HTMLElement && bar.contains(active)) {
+active.blur();
+}
 });
 }
 function maybeShowWelcome(hash) {
 if (localStorage.getItem(WELCOME_STORAGE_KEY)) return;
 if (PHOTO_HASH_RE.test(hash) || MAP_HASH_RE.test(hash)) return;
 const overlay = document.getElementById('welcome-overlay');
-if (overlay) overlay.classList.remove('d-none');
+if (!overlay) return;
+overlay.classList.remove('d-none');
+releaseWelcomeFocus?.();
+releaseWelcomeFocus = trapFocus(overlay);
 }
 function dismissWelcome(persist = true) {
 const overlay = document.getElementById('welcome-overlay');
+releaseWelcomeFocus?.();
+releaseWelcomeFocus = null;
 if (overlay) overlay.classList.add('d-none');
 if (persist) localStorage.setItem(WELCOME_STORAGE_KEY, '1');
+}
+function openNavHelp() {
+const overlay = document.getElementById('nav-help-overlay');
+if (!overlay) return;
+overlay.classList.remove('d-none');
+releaseHelpFocus?.();
+releaseHelpFocus = trapFocus(overlay);
+}
+function closeNavHelp() {
+const overlay = document.getElementById('nav-help-overlay');
+releaseHelpFocus?.();
+releaseHelpFocus = null;
+overlay?.classList.add('d-none');
 }
 function startTourFromWelcome() {
 const first = tourNavOrder()[0];
@@ -632,32 +987,48 @@ showToast('Link copiato negli appunti');
 showToast('Impossibile copiare il link');
 }
 }
+function updateSearchCountUI() {
+const el = document.getElementById('photo-search-count');
+if (!el) return;
+const q = normalizeSearchQuery(activeSearchQuery);
+const count = visiblePhotos().length;
+if (!q) {
+el.textContent = '';
+return;
+}
+el.textContent = `${count} risultato${count === 1 ? '' : 'i'} per “${activeSearchQuery.trim()}”`;
+}
 // Renderizza galleria con Bootstrap Cards
 function renderGallery() {
 const grid = document.getElementById('photo-grid');
 const photosToShow = visiblePhotos();
 if (photosToShow.length === 0) {
-const msg = activeZoneFilter
-? 'Nessuna foto in questa zona'
-: 'Nessuna foto con GPS trovata';
+const q = normalizeSearchQuery(activeSearchQuery);
+const msg = q
+? `Nessuna foto trovata per “${escapeHtml(activeSearchQuery.trim())}”.`
+: (activeZoneFilter ? 'Nessuna foto in questa zona' : 'Nessuna foto con GPS trovata');
 grid.innerHTML = `<div class="masonry-item"><div class="alert alert-warning text-center">${msg}</div></div>`;
 return;
 }
 const html = photosToShow.map((photo, seqIndex) => {
 const originalIndex = photosData.indexOf(photo);
-const label = photoLabel(seqIndex + 1);
+const label = photoLabel(photo, seqIndex + 1);
+const safeLabel = escapeHtml(label);
+const aspectStyle = photo.width && photo.height
+? ` style="aspect-ratio: ${photo.width} / ${photo.height};"`
+: '';
 return `
 <div class="masonry-item" role="listitem">
 <div class="card photo-card shadow-sm" onclick="openLightbox(${originalIndex})"
 onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openLightbox(${originalIndex})}"
-role="button" tabindex="0" aria-label="${label}">
-<img src="${photo.thumb}" alt="${label}" loading="lazy">
+role="button" tabindex="0" aria-label="${safeLabel}">
+<img src="${photo.thumb}" alt="${safeLabel}" loading="lazy"${aspectStyle}>
 <div class="card-body photo-card-body p-2">
-<div class="photo-card-label mb-1">${label}</div>
+<div class="photo-card-label mb-1">${safeLabel}</div>
 <div class="photo-card-meta d-flex flex-wrap gap-1">
 ${photo.cluster_id ? (() => {
 const zc = clusterColor(photo.cluster_id);
-return `<span class="badge" style="background:${zc};color:${zoneChipTextColor(zc)}">Zona ${photo.cluster_id}</span>`;
+return `<span class="badge" style="background:${zc};color:${zoneChipTextColor(zc)}">${escapeHtml(zoneLabel(photo.cluster_id))}</span>`;
 })() : ''}
 <span class="badge bg-success">GPS</span>
 ${photo.direction !== null && photo.direction !== undefined ?
@@ -669,6 +1040,7 @@ ${photo.direction !== null && photo.direction !== undefined ?
 `;
 }).join('');
 grid.innerHTML = html;
+updateSearchCountUI();
 }
 // Calcola bounding box che contiene il 95% delle foto
 function calculate95PercentBounds(photos) {
@@ -702,11 +1074,6 @@ initialView = [centerLat, centerLon];
 // Mappa principale
 map = L.map('map').setView(initialView, initialZoom);
 updateMapTiles(map);
-// Mappa lightbox
-mapLightbox = L.map('lightbox-map', {
-zoomControl: false
-}).setView(initialView, 15);
-updateMapTiles(mapLightbox);
 // Aggiungi marker
 updateMapMarkers();
 // Fit alla bounding box del 95%
@@ -722,6 +1089,31 @@ map.on('moveend', () => {
 if (currentView !== 'map') return;
 const c = map.getCenter();
 history.replaceState(null, '', `#${c.lat.toFixed(6)},${c.lng.toFixed(6)},${map.getZoom()}z`);
+});
+// Leaflet needs a laid-out container; defer until after first paint
+requestAnimationFrame(() => {
+requestAnimationFrame(() => {
+if (!map) return;
+map.invalidateSize();
+fitMapToVisiblePhotos();
+});
+});
+}
+function initLightboxMap(center, zoom = 15) {
+if (mapLightbox) return mapLightbox;
+const view = center || (map ? map.getCenter() : { lat: 45.4642, lng: 9.1900 });
+const latLng = Array.isArray(view) ? view : [view.lat, view.lng];
+mapLightbox = L.map('lightbox-map', {
+zoomControl: false
+}).setView(latLng, zoom);
+updateMapTiles(mapLightbox);
+return mapLightbox;
+}
+function ensureLightboxMap(photo) {
+const center = photo ? [photo.lat, photo.lon] : null;
+initLightboxMap(center, 15);
+requestAnimationFrame(() => {
+mapLightbox?.invalidateSize();
 });
 }
 // Aggiorna tiles della mappa
@@ -799,17 +1191,21 @@ map.fitBounds(bounds, { padding: [50, 50], maxZoom: 18 });
 // Cambia vista
 function switchView(view) {
 currentView = view;
-document.getElementById('gallery-view').style.display = 'none';
-document.getElementById('map-view').style.display = 'none';
-document.getElementById('photo-view').style.display = 'none';
+const galleryEl = document.getElementById('gallery-view');
+const mapEl = document.getElementById('map-view');
+const photoEl = document.getElementById('photo-view');
+galleryEl.style.display = 'none';
+mapEl.style.display = 'none';
+photoEl.style.display = 'none';
 const btnGallery = document.getElementById('viewGallery');
 const btnMap = document.getElementById('viewMap');
 if (view === 'gallery') {
-document.getElementById('gallery-view').style.display = 'block';
+galleryEl.style.display = 'flex';
+galleryEl.style.flexDirection = 'column';
 btnGallery.checked = true;
 btnMap.checked = false;
 } else if (view === 'map') {
-document.getElementById('map-view').style.display = 'block';
+mapEl.style.display = 'block';
 btnGallery.checked = false;
 btnMap.checked = true;
 setTimeout(() => {
@@ -818,11 +1214,30 @@ map.invalidateSize();
 fitMapToVisiblePhotos();
 }, 100);
 } else if (view === 'photo') {
-document.getElementById('photo-view').style.display = 'flex';
+photoEl.style.display = 'flex';
+photoEl.style.flexDirection = 'column';
 btnGallery.checked = false;
 btnMap.checked = false;
-setTimeout(() => { if (mapLightbox) mapLightbox.invalidateSize(); }, 50);
+setTimeout(() => {
+if (mapLightbox) mapLightbox.invalidateSize();
+}, 150);
 }
+}
+function leavePhotoViewFor(targetView) {
+if (currentView === 'photo') {
+stopTourPlay();
+clearLightboxImageTransition();
+hidePanoramaxPreview();
+currentLightboxIndex = -1;
+updatePageMeta(null);
+history.replaceState(
+null,
+'',
+targetView === 'map' ? (mapHashCurrent() || window.location.pathname) : window.location.pathname
+);
+updateTourProgress();
+}
+switchView(targetView);
 }
 // Cambia tipo mappa
 function switchMapType(type) {
@@ -843,6 +1258,7 @@ previousView = currentView;
 const useTransition = currentView === 'photo' && prevIndex >= 0 && prevIndex !== index;
 // Mostra la photo view
 switchView('photo');
+ensureLightboxMap(photo);
 // Re-minimize map on mobile when opening a new photo
 if (window.innerWidth <= 768) {
 const mapContainer = document.getElementById('lightbox-map-container');
@@ -856,7 +1272,8 @@ mapToggleBtn.innerHTML = mapToggleButtonContent(true);
 if (prevIndex >= 0) {
 checkZoneChange(photosData[prevIndex], photo);
 }
-updateLightboxContent(photo, { transition: useTransition, direction: navDirection });
+const fromPhoto = (prevIndex >= 0 && prevIndex !== index) ? photosData[prevIndex] : null;
+updateLightboxContent(photo, { transition: useTransition, direction: navDirection, fromPhoto });
 const navOrder = tourNavOrder();
 const seqIndex = Math.max(1, navOrder.indexOf(photo) + 1);
 updatePageMeta(photo, seqIndex);
@@ -873,80 +1290,173 @@ lightboxImageTransitionTimer = null;
 }
 removeLightboxImageNext();
 }
-function setLightboxImageInstant(imgElement, loader, src) {
+function sameLightboxSrc(imgElement, src) {
+if (!imgElement || !src) return false;
+const cur = imgElement.currentSrc || imgElement.src || '';
+return cur === src || cur.endsWith(src) || cur.includes(src);
+}
+function afterPaint(cb) {
+requestAnimationFrame(() => requestAnimationFrame(cb));
+}
+/** Fallback <img> (WebGL non disponibile): mostra subito la foto. */
+function setLightboxImageInstant(imgElement, loader, src, photo) {
+if (typeof window.resetZoom === 'function') window.resetZoom();
 imgElement.style.transition = 'none';
 imgElement.style.transform = '';
-imgElement.src = src;
+imgElement.classList.remove('morph-hidden');
+imgElement.style.visibility = '';
+applyImageAspectRatio(imgElement, photo);
+if (!sameLightboxSrc(imgElement, src)) imgElement.src = src;
 imgElement.style.opacity = '1';
 loader.style.display = 'none';
+removeLightboxImageNext();
+setMorphViewerVisible(false);
 void imgElement.offsetWidth;
 imgElement.style.transition = '';
+lightboxDisplayedPhoto = photo;
+prefetchTourNeighbors(photo);
 }
-function updateLightboxImage(photo, options = {}) {
-const { transition = false, direction = 0 } = options;
-const imgElement = document.getElementById('lightbox-image');
-const loader = document.getElementById('lightbox-loader');
-const container = imgElement?.parentElement;
-if (!imgElement || !container) return;
-clearLightboxImageTransition();
-const newImg = new Image();
-newImg.onload = function () {
-if (currentLightboxIndex !== photosData.indexOf(photo)) return;
-if (!transition || !imgElement.src) {
-setLightboxImageInstant(imgElement, loader, photo.display);
-return;
+async function finishLightboxSwap(imgElement, loader, nextEl, photo) {
+imgElement.style.transition = 'none';
+imgElement.style.transform = '';
+applyImageAspectRatio(imgElement, photo);
+if (!sameLightboxSrc(imgElement, photo.display)) imgElement.src = photo.display;
+try {
+if (imgElement.decode) await imgElement.decode();
+} catch (_) { /* decode opzionale */ }
+imgElement.style.opacity = '1';
+loader.style.display = 'none';
+afterPaint(() => {
+nextEl?.remove();
+imgElement.style.transition = '';
+});
+lightboxDisplayedPhoto = photo;
+prefetchTourNeighbors(photo);
 }
+/** Fallback <img>: dissolvenza semplice fra due immagini. */
+function runDissolveTransition(imgElement, container, loader, photo) {
 let next = document.getElementById('lightbox-image-next');
 if (!next) {
 next = document.createElement('img');
 next.id = 'lightbox-image-next';
-next.className = 'lightbox-image-next img-fluid';
-container.insertBefore(next, imgElement);
+next.className = 'lightbox-image-next';
+container.insertBefore(next, imgElement.nextSibling);
 }
-const slideIn = direction > 0 ? '2.5%' : direction < 0 ? '-2.5%' : '0';
-const slideOut = direction > 0 ? '-2%' : direction < 0 ? '2%' : '0';
-const easing = `opacity ${PHOTO_TRANSITION_MS}ms ease, transform ${PHOTO_TRANSITION_MS}ms ease`;
+const easing = `opacity ${PHOTO_TRANSITION_MS}ms ease-out`;
 next.style.transition = 'none';
 next.style.opacity = '0';
-next.style.transform = `translateX(${slideIn})`;
 next.src = photo.display;
+applyImageAspectRatio(next, photo);
 next.alt = imgElement.alt;
+imgElement.style.transition = 'none';
 void next.offsetWidth;
 next.style.transition = easing;
 imgElement.style.transition = easing;
 requestAnimationFrame(() => {
 imgElement.style.opacity = '0';
-imgElement.style.transform = `translateX(${slideOut})`;
 next.style.opacity = '1';
-next.style.transform = 'translateX(0)';
 });
 lightboxImageTransitionTimer = setTimeout(() => {
 lightboxImageTransitionTimer = null;
 if (currentLightboxIndex !== photosData.indexOf(photo)) return;
-setLightboxImageInstant(imgElement, loader, photo.display);
-}, PHOTO_TRANSITION_MS);
-};
-newImg.onerror = function () {
-if (currentLightboxIndex === photosData.indexOf(photo)) {
-loader.style.display = 'none';
+finishLightboxSwap(imgElement, loader, next, photo);
+}, PHOTO_TRANSITION_MS + 32);
 }
-};
-if (transition && imgElement.src) {
-loader.style.display = 'none';
-} else {
+function updateLightboxImage(photo, options = {}) {
+const { transition = false, fromPhoto = null } = options;
+const useTransition = transition && !prefersReducedMotion();
+const imgElement = document.getElementById('lightbox-image');
+const loader = document.getElementById('lightbox-loader');
+const container = imgElement?.parentElement;
+if (!imgElement || !container) return;
+clearLightboxImageTransition();
+const from = fromPhoto || lightboxDisplayedPhoto;
+const animate = !!(useTransition && from && photoId(from) !== photoId(photo));
 loader.style.display = 'block';
-imgElement.style.opacity = '0';
+void (async () => {
+try {
+const ok = await showWithMorphViewer(photo, { from, animate });
+if (!ok && currentLightboxIndex === photosData.indexOf(photo)) {
+setLightboxImageInstant(imgElement, loader, photo.display, photo);
 }
-newImg.src = photo.display;
+} catch (err) {
+console.warn('morph viewer non disponibile, fallback <img>', err);
+disposeMorphViewer();
+if (animate) runDissolveTransition(imgElement, container, loader, photo);
+else setLightboxImageInstant(imgElement, loader, photo.display, photo);
+}
+})();
+}
+function transitionTierLabel(tier) {
+return { morph: 'stessa inquadratura', anchor: 'stesso soggetto' }[tier] || 'correlata';
+}
+function renderCorrelatedFilmstrip(photo) {
+const section = document.getElementById('sfm-correlated');
+const strip = document.getElementById('sfm-correlated-strip');
+const count = document.getElementById('sfm-correlated-count');
+if (!section || !strip) return;
+const edges = correlatedById.get(photoId(photo)) || [];
+const byId = new Map(photosData.map(p => [photoId(p), p]));
+const available = edges.filter(edge => byId.has(edge.to));
+strip.replaceChildren();
+if (!available.length) {
+if (count) count.textContent = '0';
+const empty = document.createElement('span');
+empty.className = 'sfm-correlated-empty';
+empty.textContent = 'Nessuna vista correlata per questa foto';
+strip.appendChild(empty);
+return;
+}
+if (count) count.textContent = String(available.length);
+for (const edge of available) {
+const target = byId.get(edge.to);
+const button = document.createElement('button');
+button.type = 'button';
+button.className = `sfm-correlated-item tier-${edge.tier}`;
+button.setAttribute('role', 'listitem');
+button.dataset.photoId = edge.to;
+const score = Math.round(Number(edge.score || 0) * 100);
+button.title = `${photoLabel(target)} — ${transitionTierLabel(edge.tier)}${score ? `, affinità ${score}%` : ''}`;
+button.setAttribute('aria-label', button.title);
+const image = document.createElement('img');
+image.src = target.thumb || target.display;
+image.alt = '';
+image.loading = 'lazy';
+image.decoding = 'async';
+const badge = document.createElement('span');
+badge.className = 'sfm-correlated-badge';
+badge.textContent = transitionTierLabel(edge.tier);
+button.append(image, badge);
+button.addEventListener('click', () => {
+const index = photosData.indexOf(target);
+if (index >= 0) openLightbox(index);
+});
+strip.appendChild(button);
+}
+if (morphViewer) morphViewer.prefetchIds(available.slice(0, 6).map(edge => edge.to));
 }
 function updateLightboxContent(photo, options = {}) {
 updateLightboxImage(photo, options);
+renderCorrelatedFilmstrip(photo);
 // Sequence counter in header (ordine tour LKH filtrato per zona)
 const navOrder = tourNavOrder();
 const seqIndex = navOrder.indexOf(photo) + 1;
 document.getElementById('lightbox-sequence').textContent =
 seqIndex > 0 ? `${seqIndex} / ${navOrder.length}` : `— / ${navOrder.length}`;
-document.getElementById('lightbox-image').alt = photoLabel(seqIndex);
+const label = photoLabel(photo, seqIndex > 0 ? seqIndex : 1);
+const imgEl = document.getElementById('lightbox-image');
+imgEl.alt = label;
+applyImageAspectRatio(imgEl, photo);
+const placeEl = document.getElementById('lightbox-place');
+if (placeEl) {
+const placeText = photo.place_name || (photo.cluster_id ? zoneLabel(photo.cluster_id) : '');
+if (placeText) {
+placeEl.textContent = placeText;
+placeEl.classList.remove('d-none');
+} else {
+placeEl.classList.add('d-none');
+}
+}
 const osmEl = document.getElementById('lightbox-osm');
 if (osmEl) {
 osmEl.href = `https://www.openstreetmap.org/#map=18/${photo.lat}/${photo.lon}`;
@@ -977,8 +1487,7 @@ sfmEl.classList.add('d-none');
 }
 }
 updatePanoramaxPreview(photo);
-updateSpatialNavUI();
-const seqLabel = photoLabel(seqIndex > 0 ? seqIndex : 1);
+const seqLabel = photoLabel(photo, seqIndex > 0 ? seqIndex : 1);
 announce(seqLabel);
 updateLightboxMap(photo);
 }
@@ -986,7 +1495,7 @@ function checkZoneChange(prevPhoto, nextPhoto) {
 // Se non hanno cluster id, ignora
 if (!prevPhoto.cluster_id || !nextPhoto.cluster_id) return;
 if (prevPhoto.cluster_id !== nextPhoto.cluster_id) {
-showZoneNotification(`Nuova zona ${nextPhoto.cluster_id}`);
+showZoneNotification(`Nuova zona: ${zoneLabel(nextPhoto.cluster_id)}`);
 }
 }
 function showZoneNotification(text) {
@@ -1002,6 +1511,7 @@ alert.classList.add('d-none');
 }, 3000);
 }
 function updateLightboxMap(photo) {
+ensureLightboxMap(photo);
 if (!mapLightbox) return;
 setTimeout(() => {
 mapLightbox.invalidateSize();
@@ -1013,13 +1523,6 @@ mapLightbox.removeLayer(layer);
 });
 // Mostra tutti i marker
 const photosWithGPS = photosData.filter(p => p.has_gps && p.lat && p.lon);
-const navEntry = spatialNavEntry(photosData.indexOf(photo));
-const spatialColors = {
-forward: '#22c55e',
-back: '#f97316',
-left: '#a855f7',
-right: '#38bdf8'
-};
 photosWithGPS.forEach((p) => {
 const isCurrentPhoto = p === photo;
 const pIndex = photosData.indexOf(p);
@@ -1039,22 +1542,11 @@ weight: 3,
 fillOpacity: 1
 }).addTo(mapLightbox);
 } else {
-let fill = clusterColor(p.cluster_id);
-let radius = 7;
-let weight = 2;
-for (const role of ['forward', 'back', 'left', 'right']) {
-if (navEntry?.[role] === pIndex) {
-fill = spatialColors[role];
-radius = 10;
-weight = 3;
-break;
-}
-}
 L.circleMarker([p.lat, p.lon], {
-radius,
-fillColor: fill,
+radius: 7,
+fillColor: clusterColor(p.cluster_id),
 color: 'white',
-weight,
+weight: 2,
 fillOpacity: 0.95
 })
 .on('click', () => openLightbox(pIndex))
@@ -1062,12 +1554,13 @@ fillOpacity: 0.95
 }
 });
 mapLightbox.setView([photo.lat, photo.lon], 18);
-}, 100);
+}, 150);
 }
 function closeLightbox() {
 stopTourPlay();
 clearLightboxImageTransition();
 hidePanoramaxPreview();
+setMorphViewerVisible(false);
 currentLightboxIndex = -1;
 switchView(previousView);
 updatePageMeta(null);
@@ -1130,12 +1623,51 @@ closeLightbox();
 document.addEventListener('DOMContentLoaded', () => {
 switchView('map'); // set initial state explicitly
 loadPhotos();
+// Search UI (place/caption/zone/Foto N) - never uses original filenames
+const searchInput = document.getElementById('photo-search-input');
+const clearBtn = document.getElementById('photo-search-clear');
+const applySearch = (announceChange = true) => {
+const q = normalizeSearchQuery(activeSearchQuery);
+if (clearBtn) clearBtn.classList.toggle('d-none', !q);
+renderZoneBar();
+renderGallery();
+updateMapMarkers();
+updateTourPolyline();
+updateTourProgress();
+if (announceChange) {
+const count = visiblePhotos().length;
+if (!q) announce(`Ricerca svuotata, ${count} foto`);
+else announce(`Ricerca “${activeSearchQuery.trim()}”, ${count} foto trovate`);
+}
+};
+const onSearchInput = () => {
+activeSearchQuery = searchInput ? searchInput.value : '';
+if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+searchDebounceTimer = setTimeout(() => applySearch(true), 180);
+};
+if (searchInput) {
+searchInput.addEventListener('input', onSearchInput);
+searchInput.addEventListener('keydown', (e) => {
+if (e.key === 'Escape') {
+activeSearchQuery = '';
+searchInput.value = '';
+applySearch(true);
+}
+});
+}
+if (clearBtn) {
+clearBtn.addEventListener('click', () => {
+activeSearchQuery = '';
+if (searchInput) searchInput.value = '';
+applySearch(true);
+});
+}
 // View buttons (Bootstrap radio buttons)
 document.getElementById('viewGallery').addEventListener('change', (e) => {
-if (e.target.checked) switchView('gallery');
+if (e.target.checked) leavePhotoViewFor('gallery');
 });
 document.getElementById('viewMap').addEventListener('change', (e) => {
-if (e.target.checked) switchView('map');
+if (e.target.checked) leavePhotoViewFor('map');
 });
 document.getElementById('welcome-map-btn')?.addEventListener('click', () => {
 dismissWelcome();
@@ -1150,22 +1682,23 @@ dismissWelcome();
 startTourFromWelcome();
 });
 document.getElementById('welcome-dismiss-btn')?.addEventListener('click', () => dismissWelcome());
+document.getElementById('hero-tour-btn')?.addEventListener('click', () => {
+dismissMapHero();
+startTourFromWelcome();
+});
+document.getElementById('hero-gallery-btn')?.addEventListener('click', () => {
+dismissMapHero();
+switchView('gallery');
+});
+document.getElementById('hero-dismiss-btn')?.addEventListener('click', dismissMapHero);
+document.getElementById('nav-help-btn')?.addEventListener('click', openNavHelp);
+document.getElementById('nav-help-close-btn')?.addEventListener('click', closeNavHelp);
 document.getElementById('share-photo-btn')?.addEventListener('click', copyPhotoLink);
 document.getElementById('tour-play-btn')?.addEventListener('click', startTourPlay);
 document.getElementById('tour-pause-btn')?.addEventListener('click', () => stopTourPlay());
-document.getElementById('spatial-forward')?.addEventListener('click', () => spatialNavigate('forward'));
-document.getElementById('spatial-back')?.addEventListener('click', () => spatialNavigate('back'));
-document.getElementById('spatial-left')?.addEventListener('click', () => spatialNavigate('left'));
-document.getElementById('spatial-right')?.addEventListener('click', () => spatialNavigate('right'));
 document.getElementById('panoramax-thumb-btn')?.addEventListener('click', openPanoramaxZoom);
 document.getElementById('panoramax-zoom-close')?.addEventListener('click', closePanoramaxZoom);
 document.querySelector('.panoramax-zoom-backdrop')?.addEventListener('click', closePanoramaxZoom);
-// Map type buttons
-document.querySelectorAll('input[name="mapType"]').forEach(btn => {
-btn.addEventListener('change', (e) => {
-if (e.target.checked) switchMapType(e.target.dataset.map);
-});
-});
 // Map toggle
 const mapContainer = document.getElementById('lightbox-map-container');
 const mapToggleBtn = document.getElementById('map-toggle-btn');
@@ -1179,6 +1712,7 @@ mapToggleBtn.innerHTML = mapToggleButtonContent(isMinimized);
 mapToggleBtn.setAttribute('aria-label', isMinimized ? 'Apri mappa' : 'Chiudi mappa');
 mapToggleBtn.setAttribute('title', isMinimized ? 'Apri mappa' : 'Chiudi mappa');
 if (!isMinimized) {
+ensureLightboxMap(photosData[currentLightboxIndex]);
 setTimeout(() => {
 if (mapLightbox) mapLightbox.invalidateSize();
 }, 300); // Wait for transition
@@ -1200,6 +1734,16 @@ mapToggleBtn.setAttribute('title', 'Apri mappa');
 }
 // Keyboard navigation
 document.addEventListener('keydown', (e) => {
+const welcomeOpen = !document.getElementById('welcome-overlay')?.classList.contains('d-none');
+const helpOpen = !document.getElementById('nav-help-overlay')?.classList.contains('d-none');
+if (welcomeOpen && e.key === 'Escape') {
+dismissWelcome(false);
+return;
+}
+if (helpOpen && e.key === 'Escape') {
+closeNavHelp();
+return;
+}
 if (currentView !== 'photo') return;
 if (isPanoramaxZoomOpen()) {
 if (e.key === 'Escape') closePanoramaxZoom();
@@ -1208,22 +1752,6 @@ return;
 if (e.key === 'Escape') closeLightbox();
 if (e.key === 'ArrowLeft') navigateLightbox(-1);
 if (e.key === 'ArrowRight') navigateLightbox(1);
-if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') {
-e.preventDefault();
-spatialNavigate('forward');
-}
-if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') {
-e.preventDefault();
-spatialNavigate('back');
-}
-if (e.key === 'a' || e.key === 'A') {
-e.preventDefault();
-spatialNavigate('left');
-}
-if (e.key === 'd' || e.key === 'D') {
-e.preventDefault();
-spatialNavigate('right');
-}
 if (e.key === 'm' || e.key === 'M') toggleMap();
 });
 // Mobile Zoom & Swipe Support
@@ -1319,9 +1847,6 @@ const deltaY = startY - swipeStartY;
 if (Math.abs(deltaX) > 50 && Math.abs(deltaX) > Math.abs(deltaY) * 1.5) {
 if (deltaX < 0) navigateLightbox(1);
 else navigateLightbox(-1);
-} else if (Math.abs(deltaY) > 50 && Math.abs(deltaY) > Math.abs(deltaX) * 1.5) {
-if (deltaY < 0) spatialNavigate('forward');
-else spatialNavigate('back');
 }
 }
 }
