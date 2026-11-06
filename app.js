@@ -762,8 +762,13 @@ offset.textContent = `${Math.round(match.distM)} m`;
 }
 preview.classList.remove('d-none');
 }
+function isMobileViewport() {
+return window.matchMedia('(max-width: 768px)').matches;
+}
 function updatePanoramaxPreview(photo) {
 hidePanoramaxPreview();
+// Su mobile l'anteprima copre la foto: non la mostriamo e non la scarichiamo.
+if (isMobileViewport()) return;
 findPanoramaxPicture(photo.lat, photo.lon).then(match => {
 if (currentLightboxIndex !== photosData.indexOf(photo) || !match?.picId) return;
 currentPanoramaxMatch = match;
