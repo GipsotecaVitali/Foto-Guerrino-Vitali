@@ -48,7 +48,7 @@ const ZONE_COLORS = [
 ];
 // Bootstrap Italia sprite path
 const BI_SPRITE = ''; // icone inline in index.html (#it-link, #it-pin, #it-download)
-const ASSET_V = 'pub1';
+const ASSET_V = 'pub2';
 let pannellumLoading = null;
 // ID stabile (hash) — usato solo per permalink, mai mostrato in UI
 function photoId(photo) {
@@ -195,6 +195,8 @@ if (imgElement.decode) await imgElement.decode();
 } catch (_) {  }
 if (currentLightboxIndex !== photosData.indexOf(photo)) return;
 imgElement.style.opacity = '1';
+imgElement.style.visibility = '';
+imgElement.classList.remove('morph-hidden');
 setMorphViewerVisible(false);
 if (typeof window.resetZoom === 'function') window.resetZoom();
 }
@@ -235,19 +237,17 @@ setMorphViewerVisible(false);
 }
 function applyImageAspectRatio(img, photo) {
 if (!img || !photo) return;
+// Niente aspect-ratio CSS: usa le dimensioni naturali del file display
+// (forzare l'AR da photos.json stirava leggermente l'immagine nel box assoluto).
 img.removeAttribute('width');
 img.removeAttribute('height');
-// Sempre rispettare l'AR: niente fill/stretch del box lightbox
-if (photo.width && photo.height) {
-img.style.aspectRatio = `${photo.width} / ${photo.height}`;
-} else {
 img.style.aspectRatio = '';
-}
 img.style.width = '';
 img.style.height = '';
 img.style.maxWidth = '100%';
 img.style.maxHeight = '100%';
 img.style.objectFit = 'contain';
+img.style.objectPosition = 'center';
 }
 function trapFocus(container) {
 const focusable = container.querySelectorAll(
@@ -1883,6 +1883,8 @@ imgElement.style.transform = scale === 1 && !pointX && !pointY
 ? ''
 : `translate(${pointX}px, ${pointY}px) scale(${scale})`;
 imgElement.classList.toggle('is-zoomed', scale > 1.01);
+const resetBtn = document.getElementById('zoom-reset-btn');
+if (resetBtn) resetBtn.textContent = scale <= 1.01 ? '⟲' : `${Math.round(scale * 100)}%`;
 }
 function zoomAt(clientX, clientY, nextScale) {
 if (!zoomEnabled()) return;
@@ -1890,11 +1892,16 @@ const rect = imageContainer.getBoundingClientRect();
 const cx = clientX - rect.left - rect.width / 2;
 const cy = clientY - rect.top - rect.height / 2;
 const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, nextScale));
-const ratio = clamped / scale;
+const ratio = clamped / (scale || 1);
 pointX = (pointX - cx) * ratio + cx;
 pointY = (pointY - cy) * ratio + cy;
 scale = clamped;
 updateImageTransform();
+}
+function zoomBy(factor) {
+if (!zoomEnabled() || !imageContainer) return;
+const rect = imageContainer.getBoundingClientRect();
+zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, scale * factor);
 }
 window.resetZoom = function () {
 scale = 1;
@@ -1905,7 +1912,15 @@ if (imgElement) {
 imgElement.style.transform = '';
 imgElement.classList.remove('is-zoomed');
 }
+const resetBtn = document.getElementById('zoom-reset-btn');
+if (resetBtn) resetBtn.textContent = '⟲';
 };
+document.getElementById('zoom-in-btn')?.addEventListener('click', () => zoomBy(1.25));
+document.getElementById('zoom-out-btn')?.addEventListener('click', () => zoomBy(1 / 1.25));
+document.getElementById('zoom-reset-btn')?.addEventListener('click', () => {
+if (scale > 1.05) window.resetZoom();
+else zoomBy(ZOOM_TOGGLE);
+});
 imageContainer.addEventListener('gesturestart', (e) => e.preventDefault());
 imageContainer.addEventListener('gesturechange', (e) => e.preventDefault());
 imageContainer.addEventListener('gestureend', (e) => e.preventDefault());
