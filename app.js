@@ -48,7 +48,7 @@ const ZONE_COLORS = [
 ];
 // Bootstrap Italia sprite path
 const BI_SPRITE = ''; // icone inline in index.html (#it-link, #it-pin, #it-download)
-const ASSET_V = 'pub4';
+const ASSET_V = 'pub5';
 let pannellumLoading = null;
 // ID stabile (hash) — usato solo per permalink, mai mostrato in UI
 function photoId(photo) {
