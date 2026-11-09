@@ -185,7 +185,7 @@ async function ensureMorphViewer() {
 if (morphViewer) return morphViewer;
 if (morphViewerLoading) return morphViewerLoading;
 morphViewerLoading = (async () => {
-const mod = await import('./vendor/morph-viewer/morph-viewer.js?v=grid2d');
+const mod = await import('./vendor/morph-viewer/morph-viewer.js?v=c8da99ac');
 const container = document.querySelector('.lightbox-image-container');
 if (!container) return null;
 morphViewer = new mod.Viewer(container, {
@@ -201,6 +201,7 @@ height: p.height || 1000
 }));
 const startPhoto = photosData[currentLightboxIndex];
 await morphViewer.load(photos, startPhoto ? { startId: photoId(startPhoto) } : {});
+window.__morphViewer = morphViewer; // debug
 return morphViewer;
 })();
 try {
@@ -1802,7 +1803,7 @@ if (e.key === 'ArrowLeft') navigateLightbox(-1);
 if (e.key === 'ArrowRight') navigateLightbox(1);
 if (e.key === 'm' || e.key === 'M') toggleMap();
 });
-// Mobile Zoom & Swipe Support
+// Zoom & Swipe nel lightbox (desktop + mobile)
 const imageContainer = document.querySelector('.lightbox-image-container');
 const imgElement = document.getElementById('lightbox-image');
 // Zoom State
@@ -1813,9 +1814,44 @@ let startX = 0;
 let startY = 0;
 let isDragging = false;
 let startDist = 0;
+let pinchMid = null;
 // Swipe Navigation State
 let swipeStartX = 0;
 let swipeStartY = 0;
+let swipeStartTime = 0;
+let swipeMoved = false;
+let lastTapTime = 0;
+const MIN_SCALE = 1;
+const MAX_SCALE = 5;
+const DOUBLE_TAP_SCALE = 2.5;
+// Coordinate relative al centro del container (transform-origin: center)
+function containerPoint(clientX, clientY) {
+const r = imageContainer.getBoundingClientRect();
+return { x: clientX - r.left - r.width / 2, y: clientY - r.top - r.height / 2 };
+}
+// Zoom mantenendo fisso il punto focale sotto cursore/dita
+function zoomAt(focal, newScale) {
+newScale = Math.min(Math.max(newScale, MIN_SCALE), MAX_SCALE);
+if (newScale === scale) return;
+const k = newScale / scale;
+pointX = focal.x + (pointX - focal.x) * k;
+pointY = focal.y + (pointY - focal.y) * k;
+scale = newScale;
+updateImageTransform();
+}
+function toggleZoomAt(focal) {
+zoomAt(focal, scale > 1.05 ? 1 : DOUBLE_TAP_SCALE);
+}
+// Target dello zoom: canvas WebGL quando il morph-viewer e attivo, altrimenti <img>.
+function morphCanvas() {
+return imageContainer.querySelector('.morph-viewer-canvas.is-active');
+}
+function zoomTarget() {
+return morphCanvas() || imgElement;
+}
+function updateZoomCursor() {
+imageContainer.classList.toggle('is-zoomed', scale > 1);
+}
 // Prevent default touch behavior to stop scrolling/zooming the whole page
 imageContainer.addEventListener('gesturestart', (e) => e.preventDefault());
 imageContainer.addEventListener('gesturechange', (e) => e.preventDefault());
@@ -1824,9 +1860,14 @@ imageContainer.addEventListener('touchstart', (e) => {
 if (e.touches.length === 2) {
 // Pinch to Zoom handling
 e.preventDefault(); // Prevent page zoom
+isDragging = false;
 startDist = Math.hypot(
-e.touches[0].pageX - e.touches[1].pageX,
-e.touches[0].pageY - e.touches[1].pageY
+e.touches[0].clientX - e.touches[1].clientX,
+e.touches[0].clientY - e.touches[1].clientY
+);
+pinchMid = containerPoint(
+(e.touches[0].clientX + e.touches[1].clientX) / 2,
+(e.touches[0].clientY + e.touches[1].clientY) / 2
 );
 } else if (e.touches.length === 1) {
 // Single finger touch - could be pan (if zoomed) or swipe (if not)
@@ -1834,34 +1875,32 @@ startX = e.touches[0].pageX;
 startY = e.touches[0].pageY;
 swipeStartX = startX;
 swipeStartY = startY;
+swipeStartTime = Date.now();
+swipeMoved = false;
 isDragging = true;
 }
 }, { passive: false }); // passive: false needed for preventDefault
 imageContainer.addEventListener('touchmove', (e) => {
 if (e.touches.length === 2) {
-// Pinching
+// Pinching (zoom sul punto medio delle dita)
 e.preventDefault();
 const dist = Math.hypot(
-e.touches[0].pageX - e.touches[1].pageX,
-e.touches[0].pageY - e.touches[1].pageY
+e.touches[0].clientX - e.touches[1].clientX,
+e.touches[0].clientY - e.touches[1].clientY
 );
 if (startDist > 0) {
-const deltaScale = dist / startDist;
-// Limit scale change speed and range
-const newScale = Math.min(Math.max(scale * deltaScale, 0.5), 5); // Min 0.5x, Max 5x
-// Update scale but keep position relative for now (centered zoom)
-// Proper focal point zoom is complex, staying with center zoom for simplicity first
-scale = newScale;
-updateImageTransform();
-startDist = dist; // Reset start dist for continuous zoom
+const newScale = scale * (dist / startDist);
+zoomAt(pinchMid, newScale);
 }
+startDist = dist;
 } else if (e.touches.length === 1 && isDragging) {
 // Panning or Swiping
 const x = e.touches[0].pageX;
 const y = e.touches[0].pageY;
 const deltaX = x - startX;
 const deltaY = y - startY;
-if (scale > 1.1) {
+if (Math.abs(x - swipeStartX) > 8 || Math.abs(y - swipeStartY) > 8) swipeMoved = true;
+if (scale > 1) {
 // If zoomed in, Pan
 e.preventDefault();
 pointX += deltaX;
@@ -1879,35 +1918,54 @@ startY = y;
 }
 }, { passive: false });
 imageContainer.addEventListener('touchend', (e) => {
+if (e.touches.length === 2) return; // ancora in pinch
+if (e.touches.length === 1) { startDist = 0; return; } // transizione pinch→pan
 isDragging = false;
-if (e.touches.length === 0) {
-// All fingers off
-if (scale < 1) {
-// Reset if zoomed out too much
-resetZoom();
-} else if (scale > 1) {
-// Limit panning to boundaries if needed, or just let it be free
-// For now, no strict boundary checks
+startDist = 0;
+if (scale > 1) {
+// Zoom attivo: tap rapido senza movimento = possibile doppio-tap
+if (!swipeMoved && Date.now() - swipeStartTime < 300) {
+const now = Date.now();
+const tap = e.changedTouches[0];
+if (now - lastTapTime < 350) {
+toggleZoomAt(containerPoint(tap.clientX, tap.clientY));
+lastTapTime = 0;
 } else {
-// Not zoomed (or barely), check for swipe navigation
+lastTapTime = now;
+}
+}
+} else {
+// Not zoomed, check for swipe navigation or doppio-tap
 const deltaX = startX - swipeStartX;
 const deltaY = startY - swipeStartY;
-if (Math.abs(deltaX) > 50 && Math.abs(deltaX) > Math.abs(deltaY) * 1.5) {
+const isTap = !swipeMoved && Date.now() - swipeStartTime < 300;
+if (isTap) {
+const now = Date.now();
+const tap = e.changedTouches[0];
+if (now - lastTapTime < 350) {
+toggleZoomAt(containerPoint(tap.clientX, tap.clientY));
+lastTapTime = 0;
+} else {
+lastTapTime = now;
+}
+} else if (Math.abs(deltaX) > 50 && Math.abs(deltaX) > Math.abs(deltaY) * 1.5) {
 if (deltaX < 0) navigateLightbox(1);
 else navigateLightbox(-1);
 }
 }
-}
 });
 // MOUSE EVENTS FOR DESKTOP
-// Wheel to zoom
+// Wheel to zoom (verso il cursore)
 imageContainer.addEventListener('wheel', (e) => {
 e.preventDefault();
-const delta = -Math.sign(e.deltaY) * 0.1;
-const newScale = Math.min(Math.max(scale + delta, 0.5), 5); // Min 0.5x, Max 5x
-scale = newScale;
-updateImageTransform();
+const delta = -Math.sign(e.deltaY) * 0.25;
+zoomAt(containerPoint(e.clientX, e.clientY), scale + delta);
 }, { passive: false });
+// Doppio click: toggle zoom sul punto cliccato
+imageContainer.addEventListener('dblclick', (e) => {
+e.preventDefault();
+toggleZoomAt(containerPoint(e.clientX, e.clientY));
+});
 // Mouse Drag to Pan
 imageContainer.addEventListener('mousedown', (e) => {
 if (scale > 1) {
@@ -1935,13 +1993,22 @@ isDragging = false;
 imageContainer.addEventListener('mouseleave', () => {
 isDragging = false;
 });
+// Dimensione del contenuto visualizzato (object-fit: contain nel container)
+function fittedContentSize() {
+const cw = imageContainer.offsetWidth;
+const ch = imageContainer.offsetHeight;
+const photo = lightboxDisplayedPhoto;
+if (photo?.width && photo?.height && cw && ch) {
+const k = Math.min(cw / photo.width, ch / photo.height);
+return { w: photo.width * k, h: photo.height * k };
+}
+return { w: cw, h: ch };
+}
 // Helper to update transform
 function updateImageTransform() {
-// Calculate limit ranges
-// Image dimensions
-const imgWidth = imgElement.offsetWidth * scale;
-const imgHeight = imgElement.offsetHeight * scale;
-// Container dimensions
+const { w, h } = fittedContentSize();
+const imgWidth = w * scale;
+const imgHeight = h * scale;
 const containerWidth = imageContainer.offsetWidth;
 const containerHeight = imageContainer.offsetHeight;
 // Calculate max offsets (from center)
@@ -1952,7 +2019,12 @@ const maxOffsetY = Math.max(0, (imgHeight - containerHeight) / 2);
 // Clamp
 pointX = Math.max(-maxOffsetX, Math.min(pointX, maxOffsetX));
 pointY = Math.max(-maxOffsetY, Math.min(pointY, maxOffsetY));
-imgElement.style.transform = `translate(${pointX}px, ${pointY}px) scale(${scale})`;
+const t = `translate(${pointX}px, ${pointY}px) scale(${scale})`;
+const target = zoomTarget();
+target.style.transform = t;
+// Pulisci l'altro layer se presente
+if (target !== imgElement) imgElement.style.transform = '';
+updateZoomCursor();
 }
 // Helper to reset zoom
 window.resetZoom = function () {
@@ -1960,8 +2032,10 @@ scale = 1;
 pointX = 0;
 pointY = 0;
 imgElement.style.transform = '';
+const canvas = morphCanvas();
+if (canvas) canvas.style.transform = '';
+updateZoomCursor();
 }
-});
 // Reset zoom when opening/changing photo
 // Hook into existing functions by adding calls or overriding
 const originalUpdateLightboxContent = updateLightboxContent;
@@ -1969,3 +2043,4 @@ updateLightboxContent = function (photo, options = {}) {
 if (window.resetZoom) window.resetZoom();
 originalUpdateLightboxContent(photo, options);
 };
+});

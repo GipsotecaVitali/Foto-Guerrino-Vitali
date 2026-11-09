@@ -14229,6 +14229,8 @@ class rh {
   layers = [];
   rebuildLayout = null;
   current = null;
+  viewW = 1;
+  viewH = 1;
   running = null;
   token = 0;
   disposed = !1;
@@ -14239,7 +14241,9 @@ class rh {
       reducedMotion: t.reducedMotion ?? !1,
       canvasClass: t.canvasClass ?? "morph-viewer-canvas",
       textureCacheSize: t.textureCacheSize ?? 14
-    }, this.renderer = new Yu({ antialias: !0, alpha: !1, powerPreference: "high-performance" }), this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1)), this.renderer.setClearColor(0, 1), this.renderer.domElement.className = this.opts.canvasClass, e.appendChild(this.renderer.domElement), typeof ResizeObserver < "u" && (this.resizeObserver = new ResizeObserver(() => this.resize()), this.resizeObserver.observe(e)), this.resize();
+    }, this.renderer = new Yu({ antialias: !0, alpha: !1, powerPreference: "high-performance" });
+    const n = /Firefox\//.test(navigator.userAgent);
+    this.renderer.setPixelRatio(n ? 1 : Math.min(2, window.devicePixelRatio || 1)), this.renderer.setClearColor(0, 1), this.renderer.domElement.className = this.opts.canvasClass, e.appendChild(this.renderer.domElement), typeof ResizeObserver < "u" && (this.resizeObserver = new ResizeObserver(() => this.resize()), this.resizeObserver.observe(e)), this.resize();
   }
   get currentId() {
     return this.current?.id ?? null;
@@ -14309,8 +14313,10 @@ class rh {
     }
   }
   resize() {
-    const e = Math.max(1, this.container.clientWidth), t = Math.max(1, this.container.clientHeight);
-    this.renderer.setSize(e, t, !1), this.camera.left = 0, this.camera.right = e, this.camera.top = 0, this.camera.bottom = t, this.camera.updateProjectionMatrix(), this.applyLayout(), this.running || this.render();
+    const e = Math.max(1, Math.round(this.container.clientWidth)), t = Math.max(1, Math.round(this.container.clientHeight));
+    this.renderer.setSize(e, t, !1);
+    const n = this.renderer.getContext(), r = this.renderer.getPixelRatio() || 1;
+    n.drawingBufferWidth > 0 && Math.abs(n.drawingBufferWidth - e * r) > 1 && this.renderer.setViewport(0, 0, n.drawingBufferWidth / r, n.drawingBufferHeight / r), this.camera.left = 0, this.camera.right = e, this.camera.top = 0, this.camera.bottom = t, this.camera.updateProjectionMatrix(), this.viewW = e, this.viewH = t, this.applyLayout(), this.running || this.render();
   }
   dispose() {
     this.disposed = !0, this.token++, this.finishRunning(), this.resizeObserver?.disconnect(), this.clearLayers();
@@ -14338,7 +14344,7 @@ class rh {
     }, this.applyLayout(), n.setT(0), n.opacity = 1, this.current = e, this.render();
   }
   applyLayout() {
-    this.rebuildLayout && (this.rebuildLayout(Math.max(1, this.container.clientWidth), Math.max(1, this.container.clientHeight)), this.layers.length === 1 && this.layers[0].setT(0));
+    this.rebuildLayout && (this.rebuildLayout(this.viewW, this.viewH), this.layers.length === 1 && this.layers[0].setT(0));
   }
   clearLayers() {
     for (const e of this.layers)
@@ -14368,7 +14374,7 @@ class rh {
   }
   /** Solo per test/diagnostica: rettangolo contain della foto corrente. */
   currentRect() {
-    return this.current ? gi(this.current.width, this.current.height, this.container.clientWidth, this.container.clientHeight) : null;
+    return this.current ? gi(this.current.width, this.current.height, this.viewW, this.viewH) : null;
   }
 }
 export {
