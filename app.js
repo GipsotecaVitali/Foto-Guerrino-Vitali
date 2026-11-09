@@ -33,11 +33,8 @@ let currentPanoramaxMatch = null;
 let panoramaxPannellumViewer = null;
 let lightboxImageTransitionTimer = null;
 let lightboxDisplayedPhoto = null;
-/** Archi del grafo transizioni (schema 2), chiave "from|to" → {tier, score, link, ...}. */
 const transitionEdges = new Map();
-/** id → archi uscenti ordinati (filmstrip "viste correlate"). */
 const correlatedById = new Map();
-/** @type {import('../vendor/morph-viewer/morph-viewer.js').Viewer|null} */
 let morphViewer = null;
 let morphViewerLoading = null;
 let zoneNames = {};
@@ -102,7 +99,6 @@ im.src = p.display;
 }
 }
 const TIER_RANK = { morph: 1, anchor: 0 };
-/** Grafo transizioni visive (ALIKED+LightGlue → tools/site/build_transition_graph.py). */
 async function loadTransitionGraph() {
 try {
 // no-cache = rivalida sempre (304 se invariato): i dati cambiano a ogni rigenerazione
@@ -129,7 +125,6 @@ Number(b.score || 0) - Number(a.score || 0)
 const current = photosData[currentLightboxIndex];
 if (current) renderCorrelatedFilmstrip(current);
 } catch (_) {
-/* grafo opzionale: senza, tutte le transizioni sono crossfade */
 }
 }
 function transitionEdgeFor(fromId, toId) {
@@ -154,7 +149,6 @@ if (next && on) next.remove();
 if (container) container.classList.toggle('morph-mode', !!on);
 if (on && morphViewer) morphViewer.resize();
 }
-/** Mostra la foto nel viewer Three (morph/anchor da grafo, altrimenti crossfade). */
 async function showWithMorphViewer(photo, { from = null, animate = false } = {}) {
 const imgElement = document.getElementById('lightbox-image');
 const loader = document.getElementById('lightbox-loader');
@@ -686,8 +680,44 @@ releasePanoramaxFocus?.();
 releasePanoramaxFocus = null;
 document.getElementById('panoramax-zoom')?.classList.add('d-none');
 }
-function openPanoramaxZoom() {
-if (!currentPanoramaxMatch?.previewUrl || typeof pannellum === 'undefined') return;
+// Pannellum caricato on-demand: serve solo allo zoom Panoramax.
+let pannellumLoadingPromise = null;
+function ensurePannellum() {
+if (typeof pannellum !== 'undefined') return Promise.resolve();
+if (pannellumLoadingPromise) return pannellumLoadingPromise;
+const CDN = 'https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build';
+pannellumLoadingPromise = Promise.all([
+new Promise((resolve, reject) => {
+const link = document.createElement('link');
+link.rel = 'stylesheet';
+link.href = `${CDN}/pannellum.css`;
+link.onload = resolve;
+link.onerror = reject;
+document.head.appendChild(link);
+}),
+new Promise((resolve, reject) => {
+const script = document.createElement('script');
+script.src = `${CDN}/pannellum.js`;
+script.integrity = 'sha384-S5+w/JlcNAOymqXGNrvzn2F++XsaHTJdex6KE5VbKryfFgqJiRUJOgOkUqaiOZTf';
+script.crossOrigin = 'anonymous';
+script.onload = resolve;
+script.onerror = reject;
+document.head.appendChild(script);
+}),
+]).catch((err) => {
+pannellumLoadingPromise = null;
+throw err;
+});
+return pannellumLoadingPromise;
+}
+async function openPanoramaxZoom() {
+if (!currentPanoramaxMatch?.previewUrl) return;
+try {
+await ensurePannellum();
+} catch (err) {
+console.error('Pannellum non caricato:', err);
+return;
+}
 const zoom = document.getElementById('panoramax-zoom');
 if (!zoom) return;
 destroyPanoramaxPannellum();
@@ -834,14 +864,12 @@ updateTourPolyline();
 updateTourControlsVisibility();
 updateTourProgress();
 updateMapHero(data);
-// If the user already typed a search, we need to re-render because Foto N depends on tour order.
-if (normalizeSearchQuery(activeSearchQuery)) {
+// Ordine e numerazione "Foto N" dipendono dal tour LKH: ri-renderizza una sola volta.
 renderZoneBar();
 renderGallery();
 updateMapMarkers();
 updateTourPolyline();
 updateTourProgress();
-}
 console.info(`LKH nav active: ${lkhOrder.length} photos, ${(lkhData.length_m / 1000).toFixed(2)} km`);
 }
 }
@@ -1024,8 +1052,7 @@ const aspectStyle = photo.width && photo.height
 : '';
 return `
 <div class="masonry-item" role="listitem">
-<div class="card photo-card shadow-sm" onclick="openLightbox(${originalIndex})"
-onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openLightbox(${originalIndex})}"
+<div class="card photo-card shadow-sm" data-photo-index="${originalIndex}"
 role="button" tabindex="0" aria-label="${safeLabel}">
 <img src="${photo.thumb}" alt="${safeLabel}" loading="lazy"${aspectStyle}>
 <div class="card-body photo-card-body p-2">
@@ -1303,7 +1330,6 @@ return cur === src || cur.endsWith(src) || cur.includes(src);
 function afterPaint(cb) {
 requestAnimationFrame(() => requestAnimationFrame(cb));
 }
-/** Fallback <img> (WebGL non disponibile): mostra subito la foto. */
 function setLightboxImageInstant(imgElement, loader, src, photo) {
 if (typeof window.resetZoom === 'function') window.resetZoom();
 imgElement.style.transition = 'none';
@@ -1328,7 +1354,7 @@ applyImageAspectRatio(imgElement, photo);
 if (!sameLightboxSrc(imgElement, photo.display)) imgElement.src = photo.display;
 try {
 if (imgElement.decode) await imgElement.decode();
-} catch (_) { /* decode opzionale */ }
+} catch (_) {  }
 imgElement.style.opacity = '1';
 loader.style.display = 'none';
 afterPaint(() => {
@@ -1338,7 +1364,6 @@ imgElement.style.transition = '';
 lightboxDisplayedPhoto = photo;
 prefetchTourNeighbors(photo);
 }
-/** Fallback <img>: dissolvenza semplice fra due immagini. */
 function runDissolveTransition(imgElement, container, loader, photo) {
 let next = document.getElementById('lightbox-image-next');
 if (!next) {
@@ -1704,6 +1729,24 @@ document.getElementById('tour-pause-btn')?.addEventListener('click', () => stopT
 document.getElementById('panoramax-thumb-btn')?.addEventListener('click', openPanoramaxZoom);
 document.getElementById('panoramax-zoom-close')?.addEventListener('click', closePanoramaxZoom);
 document.querySelector('.panoramax-zoom-backdrop')?.addEventListener('click', closePanoramaxZoom);
+document.getElementById('lbx-prev-btn')?.addEventListener('click', () => navigateLightbox(-1));
+document.getElementById('lbx-next-btn')?.addEventListener('click', () => navigateLightbox(1));
+document.getElementById('lbx-close-btn')?.addEventListener('click', () => closeLightbox());
+// Galleria: event delegation (click + tastiera) sulle card
+document.getElementById('photo-grid')?.addEventListener('click', (e) => {
+const card = e.target.closest('.photo-card');
+if (!card) return;
+const idx = Number(card.dataset.photoIndex);
+if (Number.isInteger(idx)) openLightbox(idx);
+});
+document.getElementById('photo-grid')?.addEventListener('keydown', (e) => {
+if (e.key !== 'Enter' && e.key !== ' ') return;
+const card = e.target.closest('.photo-card');
+if (!card) return;
+e.preventDefault();
+const idx = Number(card.dataset.photoIndex);
+if (Number.isInteger(idx)) openLightbox(idx);
+});
 // Map toggle
 const mapContainer = document.getElementById('lightbox-map-container');
 const mapToggleBtn = document.getElementById('map-toggle-btn');
