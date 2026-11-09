@@ -48,7 +48,7 @@ const ZONE_COLORS = [
 ];
 // Bootstrap Italia sprite path
 const BI_SPRITE = ''; // icone inline in index.html (#it-link, #it-pin, #it-download)
-const ASSET_V = 'pub3';
+const ASSET_V = 'pub4';
 let pannellumLoading = null;
 // ID stabile (hash) — usato solo per permalink, mai mostrato in UI
 function photoId(photo) {
@@ -154,7 +154,11 @@ img.style.visibility = '';
 }
 if (next && on) next.remove();
 if (container) container.classList.toggle('morph-mode', !!on);
-if (on && morphViewer) morphViewer.resize();
+if (on && morphViewer) {
+morphViewer.resize();
+// Dopo display:block il layout può aggiornarsi al frame successivo.
+requestAnimationFrame(() => morphViewer?.resize());
+}
 }
 async function showWithMorphViewer(photo, { from = null, animate = false } = {}) {
 const imgElement = document.getElementById('lightbox-image');
