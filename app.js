@@ -48,7 +48,7 @@ const ZONE_COLORS = [
 ];
 // Bootstrap Italia sprite path
 const BI_SPRITE = ''; // icone inline in index.html (#it-link, #it-pin, #it-download)
-const ASSET_V = 'pub2';
+const ASSET_V = 'pub3';
 let pannellumLoading = null;
 // ID stabile (hash) — usato solo per permalink, mai mostrato in UI
 function photoId(photo) {
@@ -137,13 +137,18 @@ const container = document.querySelector('.lightbox-image-container');
 const img = document.getElementById('lightbox-image');
 const next = document.getElementById('lightbox-image-next');
 const canvas = container?.querySelector('.morph-viewer-canvas');
-if (canvas) canvas.classList.toggle('is-active', !!on);
+if (canvas) {
+canvas.classList.toggle('is-active', !!on);
+// Three.js crea il canvas con style.display="block" inline: il CSS da solo non basta.
+canvas.style.display = on ? 'block' : 'none';
+}
 if (img) {
 img.classList.toggle('morph-hidden', !!on);
 if (on) {
 img.style.opacity = '0';
 img.style.visibility = 'hidden';
 } else {
+img.style.opacity = '1';
 img.style.visibility = '';
 }
 }
@@ -212,12 +217,12 @@ transitionLookup: transitionEdgeFor,
 reducedMotion: prefersReducedMotion(),
 crossfadeMs: PHOTO_TRANSITION_MS
 });
-const photos = photosData.map((p) => ({
-id: photoId(p),
-url: p.display,
-width: p.width || 1000,
-height: p.height || 1000
-}));
+const photos = photosData.map((p) => {
+const w = p.width || 1000, h = p.height || 1000;
+const maxSide = Math.max(w, h);
+const s = maxSide > 1920 ? 1920 / maxSide : 1;
+return { id: photoId(p), url: p.display, width: Math.round(w * s), height: Math.round(h * s) };
+});
 const startPhoto = photosData[currentLightboxIndex];
 await morphViewer.load(photos, startPhoto ? { startId: photoId(startPhoto) } : {});
 return morphViewer;
