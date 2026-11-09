@@ -14364,7 +14364,7 @@ class rh {
   }
   link(e) {
     let t = this.links.get(e);
-    return t || (t = fetch(e, { cache: "no-cache" }).then((n) => n.ok ? n.json() : null).catch(() => null), this.links.set(e, t)), t;
+    return t || (t = fetch(e).then((n) => n.ok ? n.json() : null).catch(() => null), this.links.set(e, t)), t;
   }
   /** Solo per test/diagnostica: rettangolo contain della foto corrente. */
   currentRect() {
@@ -14374,4 +14374,3 @@ class rh {
 export {
   rh as Viewer
 };
-//# sourceMappingURL=morph-viewer.js.map

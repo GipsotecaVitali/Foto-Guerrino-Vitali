@@ -1,0 +1,7 @@
+# Non pubblicare duplicati legacy / debug / source map
+photos/
+thumbs/
+data/
+graph_viewer.html
+sprites.svg
+*.map

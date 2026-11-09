@@ -33,11 +33,8 @@ let currentPanoramaxMatch = null;
 let panoramaxPannellumViewer = null;
 let lightboxImageTransitionTimer = null;
 let lightboxDisplayedPhoto = null;
-/** Archi del grafo transizioni (schema 2), chiave "from|to" → {tier, score, link, ...}. */
 const transitionEdges = new Map();
-/** id → archi uscenti ordinati (filmstrip "viste correlate"). */
 const correlatedById = new Map();
-/** @type {import('../vendor/morph-viewer/morph-viewer.js').Viewer|null} */
 let morphViewer = null;
 let morphViewerLoading = null;
 let zoneNames = {};
@@ -50,7 +47,9 @@ const ZONE_COLORS = [
 '#34d399', '#c084fc'
 ];
 // Bootstrap Italia sprite path
-const BI_SPRITE = 'sprites.svg';
+const BI_SPRITE = ''; // icone inline in index.html (#it-link, #it-pin, #it-download)
+const ASSET_V = 'pub1';
+let pannellumLoading = null;
 // ID stabile (hash) — usato solo per permalink, mai mostrato in UI
 function photoId(photo) {
 return photo.id || photo.display.split('/').pop().split('.')[0];
@@ -102,11 +101,10 @@ im.src = p.display;
 }
 }
 const TIER_RANK = { morph: 1, anchor: 0 };
-/** Grafo transizioni visive (ALIKED+LightGlue → tools/site/build_transition_graph.py). */
 async function loadTransitionGraph() {
 try {
 // no-cache = rivalida sempre (304 se invariato): i dati cambiano a ogni rigenerazione
-const res = await fetch('dati/transition_graph.json', { cache: 'no-cache' });
+const res = await fetch('dati/transition_graph.json');
 if (!res.ok) return;
 const data = await res.json();
 if (Number(data.schema_version) !== 2) return;
@@ -129,7 +127,6 @@ Number(b.score || 0) - Number(a.score || 0)
 const current = photosData[currentLightboxIndex];
 if (current) renderCorrelatedFilmstrip(current);
 } catch (_) {
-/* grafo opzionale: senza, tutte le transizioni sono crossfade */
 }
 }
 function transitionEdgeFor(fromId, toId) {
@@ -154,7 +151,6 @@ if (next && on) next.remove();
 if (container) container.classList.toggle('morph-mode', !!on);
 if (on && morphViewer) morphViewer.resize();
 }
-/** Mostra la foto nel viewer Three (morph/anchor da grafo, altrimenti crossfade). */
 async function showWithMorphViewer(photo, { from = null, animate = false } = {}) {
 const imgElement = document.getElementById('lightbox-image');
 const loader = document.getElementById('lightbox-loader');
@@ -185,13 +181,28 @@ if (order[i - 1]) near.push(photoId(order[i - 1]));
 if (order[i + 1]) near.push(photoId(order[i + 1]));
 }
 viewer.prefetchIds(near);
+// Dopo il morph resta l'<img>: zoom, pan e download agiscono su un solo elemento.
+await handoffMorphToImage(photo);
 return true;
+}
+async function handoffMorphToImage(photo) {
+const imgElement = document.getElementById('lightbox-image');
+if (!imgElement || !photo) return;
+applyImageAspectRatio(imgElement, photo);
+if (!sameLightboxSrc(imgElement, photo.display)) imgElement.src = photo.display;
+try {
+if (imgElement.decode) await imgElement.decode();
+} catch (_) {  }
+if (currentLightboxIndex !== photosData.indexOf(photo)) return;
+imgElement.style.opacity = '1';
+setMorphViewerVisible(false);
+if (typeof window.resetZoom === 'function') window.resetZoom();
 }
 async function ensureMorphViewer() {
 if (morphViewer) return morphViewer;
 if (morphViewerLoading) return morphViewerLoading;
 morphViewerLoading = (async () => {
-const mod = await import('./vendor/morph-viewer/morph-viewer.js?v=grid2d');
+const mod = await import(`./vendor/morph-viewer/morph-viewer.js?v=${ASSET_V}`);
 const container = document.querySelector('.lightbox-image-container');
 if (!container) return null;
 morphViewer = new mod.Viewer(container, {
@@ -347,7 +358,7 @@ setCanonical(homeUrl);
 // Helper per icone SVG Bootstrap Italia
 function biIcon(name, extraClass = '') {
 const cls = extraClass ? `icon ${extraClass}` : 'icon icon-xs';
-return `<svg class="${cls}"><use href="${BI_SPRITE}#${name}"></use></svg>`;
+return `<svg class="${cls}" aria-hidden="true"><use href="#${name}"></use></svg>`;
 }
 function photosWithGps() {
 return photosData.filter(p => p.has_gps && p.lat && p.lon);
@@ -686,8 +697,31 @@ releasePanoramaxFocus?.();
 releasePanoramaxFocus = null;
 document.getElementById('panoramax-zoom')?.classList.add('d-none');
 }
-function openPanoramaxZoom() {
-if (!currentPanoramaxMatch?.previewUrl || typeof pannellum === 'undefined') return;
+function loadPannellum() {
+if (typeof pannellum !== 'undefined') return Promise.resolve();
+if (pannellumLoading) return pannellumLoading;
+pannellumLoading = new Promise((resolve, reject) => {
+const css = document.createElement('link');
+css.rel = 'stylesheet';
+css.href = 'https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.css';
+document.head.appendChild(css);
+const script = document.createElement('script');
+script.src = 'https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.js';
+script.onload = () => resolve();
+script.onerror = () => reject(new Error('Pannellum non caricato'));
+document.body.appendChild(script);
+});
+return pannellumLoading;
+}
+async function openPanoramaxZoom() {
+if (!currentPanoramaxMatch?.previewUrl) return;
+try {
+await loadPannellum();
+} catch (_) {
+showToast('Anteprima Panoramax non disponibile');
+return;
+}
+if (typeof pannellum === 'undefined') return;
 const zoom = document.getElementById('panoramax-zoom');
 if (!zoom) return;
 destroyPanoramaxPannellum();
@@ -804,7 +838,7 @@ lon: lon2 * 180 / Math.PI
 // Carica dati
 async function loadPhotos() {
 try {
-const response = await fetch('dati/photos.json', { cache: 'no-cache' });
+const response = await fetch('dati/photos.json');
 const data = await response.json();
 photosData = data.photos;
 zoneNames = data.zone_names || {};
@@ -821,7 +855,7 @@ initMaps();
 await loadTransitionGraph();
 // Try to load LKH precomputed tour (non-blocking)
 try {
-const lkhRes = await fetch('dati/lkh_tour.json', { cache: 'no-cache' });
+const lkhRes = await fetch('dati/lkh_tour.json');
 if (lkhRes.ok) {
 const lkhData = await lkhRes.json();
 const byIdx = new Map(photosData.map((p, i) => [i, p]));
@@ -985,12 +1019,63 @@ if (first) openLightbox(photosData.indexOf(first));
 }
 async function copyPhotoLink() {
 const url = window.location.href;
+const photo = photosData[currentLightboxIndex];
+const title = photo ? photoLabel(photo) : document.title;
+if (navigator.share) {
+try {
+await navigator.share({ title, url });
+return;
+} catch (err) {
+if (err?.name === 'AbortError') return;
+}
+}
 try {
 await navigator.clipboard.writeText(url);
 showToast('Link copiato negli appunti');
 } catch (_) {
 showToast('Impossibile copiare il link');
 }
+}
+async function downloadCurrentPhoto() {
+const photo = photosData[currentLightboxIndex];
+if (!photo?.display) return;
+showToast('Preparazione download…');
+try {
+const res = await fetch(photo.display);
+if (!res.ok) throw new Error('fetch');
+const blob = await res.blob();
+const bitmap = await createImageBitmap(blob);
+const canvas = document.createElement('canvas');
+canvas.width = bitmap.width;
+canvas.height = bitmap.height;
+const ctx = canvas.getContext('2d');
+ctx.fillStyle = '#fff';
+ctx.fillRect(0, 0, canvas.width, canvas.height);
+ctx.drawImage(bitmap, 0, 0);
+bitmap.close?.();
+const jpeg = await new Promise((resolve, reject) => {
+canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('jpeg'))), 'image/jpeg', 0.9);
+});
+const a = document.createElement('a');
+const url = URL.createObjectURL(jpeg);
+a.href = url;
+a.download = `guerrino-vitali-${photoId(photo)}.jpg`;
+document.body.appendChild(a);
+a.click();
+a.remove();
+URL.revokeObjectURL(url);
+showToast('Download avviato');
+} catch (_) {
+showToast('Download non riuscito');
+}
+}
+function setPhotoMetaExpanded(open) {
+const bar = document.querySelector('.photo-meta-bar');
+const btn = document.getElementById('lightbox-meta-more');
+if (!bar || !btn) return;
+bar.classList.toggle('is-open', !!open);
+btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+btn.textContent = open ? 'Nascondi' : 'Dettagli';
 }
 function updateSearchCountUI() {
 const el = document.getElementById('photo-search-count');
@@ -1204,6 +1289,7 @@ mapEl.style.display = 'none';
 photoEl.style.display = 'none';
 const btnGallery = document.getElementById('viewGallery');
 const btnMap = document.getElementById('viewMap');
+document.body.classList.toggle('photo-open', view === 'photo');
 if (view === 'gallery') {
 galleryEl.style.display = 'flex';
 galleryEl.style.flexDirection = 'column';
@@ -1223,6 +1309,7 @@ photoEl.style.display = 'flex';
 photoEl.style.flexDirection = 'column';
 btnGallery.checked = false;
 btnMap.checked = false;
+setPhotoMetaExpanded(false);
 setTimeout(() => {
 if (mapLightbox) mapLightbox.invalidateSize();
 }, 150);
@@ -1303,7 +1390,6 @@ return cur === src || cur.endsWith(src) || cur.includes(src);
 function afterPaint(cb) {
 requestAnimationFrame(() => requestAnimationFrame(cb));
 }
-/** Fallback <img> (WebGL non disponibile): mostra subito la foto. */
 function setLightboxImageInstant(imgElement, loader, src, photo) {
 if (typeof window.resetZoom === 'function') window.resetZoom();
 imgElement.style.transition = 'none';
@@ -1328,7 +1414,7 @@ applyImageAspectRatio(imgElement, photo);
 if (!sameLightboxSrc(imgElement, photo.display)) imgElement.src = photo.display;
 try {
 if (imgElement.decode) await imgElement.decode();
-} catch (_) { /* decode opzionale */ }
+} catch (_) {  }
 imgElement.style.opacity = '1';
 loader.style.display = 'none';
 afterPaint(() => {
@@ -1338,7 +1424,6 @@ imgElement.style.transition = '';
 lightboxDisplayedPhoto = photo;
 prefetchTourNeighbors(photo);
 }
-/** Fallback <img>: dissolvenza semplice fra due immagini. */
 function runDissolveTransition(imgElement, container, loader, photo) {
 let next = document.getElementById('lightbox-image-next');
 if (!next) {
@@ -1566,6 +1651,7 @@ stopTourPlay();
 clearLightboxImageTransition();
 hidePanoramaxPreview();
 setMorphViewerVisible(false);
+if (typeof window.resetZoom === 'function') window.resetZoom();
 currentLightboxIndex = -1;
 switchView(previousView);
 updatePageMeta(null);
@@ -1699,6 +1785,11 @@ document.getElementById('hero-dismiss-btn')?.addEventListener('click', dismissMa
 document.getElementById('nav-help-btn')?.addEventListener('click', openNavHelp);
 document.getElementById('nav-help-close-btn')?.addEventListener('click', closeNavHelp);
 document.getElementById('share-photo-btn')?.addEventListener('click', copyPhotoLink);
+document.getElementById('download-photo-btn')?.addEventListener('click', downloadCurrentPhoto);
+document.getElementById('lightbox-meta-more')?.addEventListener('click', () => {
+const bar = document.querySelector('.photo-meta-bar');
+setPhotoMetaExpanded(!bar?.classList.contains('is-open'));
+});
 document.getElementById('tour-play-btn')?.addEventListener('click', startTourPlay);
 document.getElementById('tour-pause-btn')?.addEventListener('click', () => stopTourPlay());
 document.getElementById('panoramax-thumb-btn')?.addEventListener('click', openPanoramaxZoom);
@@ -1742,7 +1833,7 @@ document.addEventListener('keydown', (e) => {
 const welcomeOpen = !document.getElementById('welcome-overlay')?.classList.contains('d-none');
 const helpOpen = !document.getElementById('nav-help-overlay')?.classList.contains('d-none');
 if (welcomeOpen && e.key === 'Escape') {
-dismissWelcome(false);
+dismissWelcome(true);
 return;
 }
 if (helpOpen && e.key === 'Escape') {
@@ -1759,10 +1850,9 @@ if (e.key === 'ArrowLeft') navigateLightbox(-1);
 if (e.key === 'ArrowRight') navigateLightbox(1);
 if (e.key === 'm' || e.key === 'M') toggleMap();
 });
-// Mobile Zoom & Swipe Support
+// Zoom / pan sull'<img> (dopo il morph il canvas viene nascosto). Swipe solo a scale≈1.
 const imageContainer = document.querySelector('.lightbox-image-container');
 const imgElement = document.getElementById('lightbox-image');
-// Zoom State
 let scale = 1;
 let pointX = 0;
 let pointY = 0;
@@ -1770,83 +1860,121 @@ let startX = 0;
 let startY = 0;
 let isDragging = false;
 let startDist = 0;
-// Swipe Navigation State
+let pinchMidX = 0;
+let pinchMidY = 0;
 let swipeStartX = 0;
 let swipeStartY = 0;
-// Prevent default touch behavior to stop scrolling/zooming the whole page
+let lastTapAt = 0;
+const ZOOM_MIN = 1;
+const ZOOM_MAX = 5;
+const ZOOM_TOGGLE = 2.5;
+function zoomEnabled() {
+return !!imgElement && !imageContainer?.classList.contains('morph-mode');
+}
+function updateImageTransform() {
+if (!imgElement || !imageContainer) return;
+const imgWidth = imgElement.offsetWidth * scale;
+const imgHeight = imgElement.offsetHeight * scale;
+const maxOffsetX = Math.max(0, (imgWidth - imageContainer.offsetWidth) / 2);
+const maxOffsetY = Math.max(0, (imgHeight - imageContainer.offsetHeight) / 2);
+pointX = Math.max(-maxOffsetX, Math.min(pointX, maxOffsetX));
+pointY = Math.max(-maxOffsetY, Math.min(pointY, maxOffsetY));
+imgElement.style.transform = scale === 1 && !pointX && !pointY
+? ''
+: `translate(${pointX}px, ${pointY}px) scale(${scale})`;
+imgElement.classList.toggle('is-zoomed', scale > 1.01);
+}
+function zoomAt(clientX, clientY, nextScale) {
+if (!zoomEnabled()) return;
+const rect = imageContainer.getBoundingClientRect();
+const cx = clientX - rect.left - rect.width / 2;
+const cy = clientY - rect.top - rect.height / 2;
+const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, nextScale));
+const ratio = clamped / scale;
+pointX = (pointX - cx) * ratio + cx;
+pointY = (pointY - cy) * ratio + cy;
+scale = clamped;
+updateImageTransform();
+}
+window.resetZoom = function () {
+scale = 1;
+pointX = 0;
+pointY = 0;
+isDragging = false;
+if (imgElement) {
+imgElement.style.transform = '';
+imgElement.classList.remove('is-zoomed');
+}
+};
 imageContainer.addEventListener('gesturestart', (e) => e.preventDefault());
 imageContainer.addEventListener('gesturechange', (e) => e.preventDefault());
 imageContainer.addEventListener('gestureend', (e) => e.preventDefault());
 imageContainer.addEventListener('touchstart', (e) => {
+if (!zoomEnabled()) return;
 if (e.touches.length === 2) {
-// Pinch to Zoom handling
-e.preventDefault(); // Prevent page zoom
+e.preventDefault();
 startDist = Math.hypot(
 e.touches[0].pageX - e.touches[1].pageX,
 e.touches[0].pageY - e.touches[1].pageY
 );
+pinchMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+pinchMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+isDragging = false;
 } else if (e.touches.length === 1) {
-// Single finger touch - could be pan (if zoomed) or swipe (if not)
 startX = e.touches[0].pageX;
 startY = e.touches[0].pageY;
 swipeStartX = startX;
 swipeStartY = startY;
 isDragging = true;
 }
-}, { passive: false }); // passive: false needed for preventDefault
+}, { passive: false });
 imageContainer.addEventListener('touchmove', (e) => {
+if (!zoomEnabled()) return;
 if (e.touches.length === 2) {
-// Pinching
 e.preventDefault();
 const dist = Math.hypot(
 e.touches[0].pageX - e.touches[1].pageX,
 e.touches[0].pageY - e.touches[1].pageY
 );
 if (startDist > 0) {
-const deltaScale = dist / startDist;
-// Limit scale change speed and range
-const newScale = Math.min(Math.max(scale * deltaScale, 0.5), 5); // Min 0.5x, Max 5x
-// Update scale but keep position relative for now (centered zoom)
-// Proper focal point zoom is complex, staying with center zoom for simplicity first
-scale = newScale;
-updateImageTransform();
-startDist = dist; // Reset start dist for continuous zoom
+zoomAt(pinchMidX, pinchMidY, scale * (dist / startDist));
+startDist = dist;
+pinchMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+pinchMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
 }
 } else if (e.touches.length === 1 && isDragging) {
-// Panning or Swiping
 const x = e.touches[0].pageX;
 const y = e.touches[0].pageY;
 const deltaX = x - startX;
 const deltaY = y - startY;
-if (scale > 1.1) {
-// If zoomed in, Pan
+if (scale > 1.05) {
 e.preventDefault();
 pointX += deltaX;
 pointY += deltaY;
 updateImageTransform();
-} else {
-// Check if it's a horizontal swipe for navigation
-// allow vertical scrolling of page if needed (though lightbox is fixed)
-if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 10) {
-e.preventDefault(); // Lock scroll if horizontal swipe
-}
+} else if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 10) {
+e.preventDefault();
 }
 startX = x;
 startY = y;
 }
 }, { passive: false });
 imageContainer.addEventListener('touchend', (e) => {
-isDragging = false;
+if (!zoomEnabled()) return;
 if (e.touches.length === 0) {
-// All fingers off
-if (scale < 1) {
-// Reset if zoomed out too much
-resetZoom();
-} else if (scale > 1) {
-// Limit panning to boundaries if needed, or just let it be free
-// For now, no strict boundary checks
+const wasDrag = Math.hypot(startX - swipeStartX, startY - swipeStartY) > 12;
+isDragging = false;
+if (scale < 1.02) resetZoom();
+else updateImageTransform();
+if (scale <= 1.05 && !wasDrag) {
+const now = Date.now();
+if (now - lastTapAt < 280) {
+zoomAt(startX, startY, scale > 1.2 ? 1 : ZOOM_TOGGLE);
+lastTapAt = 0;
 } else {
-// Not zoomed (or barely), check for swipe navigation
+lastTapAt = now;
+}
+} else if (scale <= 1.05) {
 const deltaX = startX - swipeStartX;
 const deltaY = startY - swipeStartY;
 if (Math.abs(deltaX) > 50 && Math.abs(deltaX) > Math.abs(deltaY) * 1.5) {
@@ -1856,71 +1984,42 @@ else navigateLightbox(-1);
 }
 }
 });
-// MOUSE EVENTS FOR DESKTOP
-// Wheel to zoom
 imageContainer.addEventListener('wheel', (e) => {
+if (!zoomEnabled()) return;
 e.preventDefault();
-const delta = -Math.sign(e.deltaY) * 0.1;
-const newScale = Math.min(Math.max(scale + delta, 0.5), 5); // Min 0.5x, Max 5x
-scale = newScale;
-updateImageTransform();
+const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+zoomAt(e.clientX, e.clientY, scale * factor);
 }, { passive: false });
-// Mouse Drag to Pan
 imageContainer.addEventListener('mousedown', (e) => {
-if (scale > 1) {
+if (!zoomEnabled() || e.button !== 0) return;
+if (scale > 1.05) {
 isDragging = true;
 startX = e.clientX;
 startY = e.clientY;
-e.preventDefault(); // Prevent default drag behavior
+e.preventDefault();
 }
 });
 imageContainer.addEventListener('mousemove', (e) => {
-if (isDragging && scale > 1) {
+if (!isDragging || scale <= 1.05) return;
 e.preventDefault();
-const deltaX = e.clientX - startX;
-const deltaY = e.clientY - startY;
-pointX += deltaX;
-pointY += deltaY;
+pointX += e.clientX - startX;
+pointY += e.clientY - startY;
 startX = e.clientX;
 startY = e.clientY;
 updateImageTransform();
-}
 });
-imageContainer.addEventListener('mouseup', () => {
-isDragging = false;
+imageContainer.addEventListener('mouseup', () => { isDragging = false; });
+imageContainer.addEventListener('mouseleave', () => { isDragging = false; });
+imageContainer.addEventListener('dblclick', (e) => {
+if (!zoomEnabled() || e.target.closest('button, a')) return;
+e.preventDefault();
+zoomAt(e.clientX, e.clientY, scale > 1.2 ? 1 : ZOOM_TOGGLE);
 });
-imageContainer.addEventListener('mouseleave', () => {
-isDragging = false;
+// Non bloccare il menu contestuale sull'immagine (salvataggio nativo).
+imgElement?.addEventListener('dragstart', (e) => {
+if (scale > 1.05) e.preventDefault();
 });
-// Helper to update transform
-function updateImageTransform() {
-// Calculate limit ranges
-// Image dimensions
-const imgWidth = imgElement.offsetWidth * scale;
-const imgHeight = imgElement.offsetHeight * scale;
-// Container dimensions
-const containerWidth = imageContainer.offsetWidth;
-const containerHeight = imageContainer.offsetHeight;
-// Calculate max offsets (from center)
-// If image is smaller than container effectively, max offset is 0 (keep centered)
-// If image is larger, max offset is (imgDim - containerDim) / 2
-const maxOffsetX = Math.max(0, (imgWidth - containerWidth) / 2);
-const maxOffsetY = Math.max(0, (imgHeight - containerHeight) / 2);
-// Clamp
-pointX = Math.max(-maxOffsetX, Math.min(pointX, maxOffsetX));
-pointY = Math.max(-maxOffsetY, Math.min(pointY, maxOffsetY));
-imgElement.style.transform = `translate(${pointX}px, ${pointY}px) scale(${scale})`;
-}
-// Helper to reset zoom
-window.resetZoom = function () {
-scale = 1;
-pointX = 0;
-pointY = 0;
-imgElement.style.transform = '';
-}
 });
-// Reset zoom when opening/changing photo
-// Hook into existing functions by adding calls or overriding
 const originalUpdateLightboxContent = updateLightboxContent;
 updateLightboxContent = function (photo, options = {}) {
 if (window.resetZoom) window.resetZoom();
