@@ -54,7 +54,7 @@ async function ensureMorphViewer() {
 if (morphViewer) return morphViewer;
 if (morphViewerLoading) return morphViewerLoading;
 morphViewerLoading = (async () => {
-const mod = await import('./vendor/morph-viewer/morph-viewer.js?v=c8da99ac');
+const mod = await import('../vendor/morph-viewer/morph-viewer.js?v=c8da99ac');
 const container = document.querySelector('.lightbox-image-container');
 if (!container) return null;
 morphViewer = new mod.Viewer(container, {
