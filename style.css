@@ -959,3 +959,35 @@ footer.copyright {
 .lightbox-image-container.is-zoomed:active {
   cursor: grabbing;
 }
+
+/* Selettore vista Galleria/Mappa: pill con stato attivo evidente */
+.view-switch {
+  display: inline-flex;
+  gap: 0.25rem;
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: 999px;
+  padding: 0.25rem;
+}
+.view-switch-btn {
+  border-radius: 999px;
+  padding: 0.3rem 0.9rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  line-height: 1.25;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  border: none;
+  user-select: none;
+  transition: background 0.15s, color 0.15s;
+}
+.view-switch-btn:hover {
+  color: #fff;
+}
+.btn-check:checked + .view-switch-btn {
+  background: #fff;
+  color: #0066cc;
+}
+.btn-check:focus-visible + .view-switch-btn {
+  outline: 3px solid #ff9900;
+  outline-offset: 2px;
+}
